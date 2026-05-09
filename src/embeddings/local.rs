@@ -1,26 +1,17 @@
-//! Embedding layer — fastembed wrapper.
+//! Local embedding backend — fastembed (ONNX runtime).
 //!
 //! Default model: `all-MiniLM-L6-v2` (384 dim) — mcp-memory-service-rs と
 //! 同一 vector space を使うため、DB を swap しても retrieval semantics が
 //! 保たれる。
 //!
-//! Backends:
-//! - `local` (default): `fastembed` で ONNX を CPU 実行。RSS ~175MB。
-//! - `external`: OpenAI 互換 API に POST。RSS <30MB だがネットワーク必須。
-//!
 //! Lazy load: model は initial `embed` 呼び出し時に load される。`serve`
-//! cold-start を 23MB 程度に抑える。
+//! cold-start を 23 MB 程度に抑える。
 
+use super::Embedder;
 use crate::{HippoError, Result, EMBEDDING_DIM};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-/// 384 次元の embedding を生成する trait。テスト時に mock 差し替え可。
-pub trait Embedder: Send + Sync {
-    fn embed_one(&self, text: &str) -> Result<Vec<f32>>;
-    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
-}
 
 /// 384 次元を保つ ONNX モデル。`--embedding-model` から選択。
 ///
@@ -95,7 +86,7 @@ impl FastEmbedder {
         let cache_dir = std::env::var("HIPPO_MODEL_CACHE")
             .ok()
             .map(PathBuf::from)
-            .unwrap_or_else(default_cache_dir);
+            .unwrap_or_else(super::default_cache_dir);
         Self::new(cache_dir)
     }
 
@@ -166,95 +157,9 @@ impl Embedder for FastEmbedder {
     }
 }
 
-pub fn default_cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("claude-hippo")
-        .join("models")
-}
-
-/// Mock implementation: テスト・bench 用。content の hash を expand して
-/// deterministic な L2 normalized vector を返す。
-pub struct MockEmbedder;
-
-impl MockEmbedder {
-    pub fn new() -> Self {
-        Self
-    }
-
-    fn deterministic_vec(text: &str) -> Vec<f32> {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(text.as_bytes());
-        let seed = h.finalize();
-        let mut v = vec![0.0_f32; EMBEDDING_DIM];
-        // seed (32 bytes) を repeat して 384 dim 埋める。
-        for (i, b) in (0..EMBEDDING_DIM).zip(seed.iter().cycle()) {
-            // -1.0..=1.0 にマップ
-            v[i] = (*b as f32 / 127.5) - 1.0;
-        }
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
-        v
-    }
-}
-
-impl Default for MockEmbedder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Embedder for MockEmbedder {
-    fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
-        Ok(Self::deterministic_vec(text))
-    }
-
-    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|t| Self::deterministic_vec(t)).collect())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mock_dims_and_l2_norm() {
-        let m = MockEmbedder::new();
-        let v = m.embed_one("hello").unwrap();
-        assert_eq!(v.len(), EMBEDDING_DIM);
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4, "norm = {norm}");
-    }
-
-    #[test]
-    fn mock_deterministic() {
-        let m = MockEmbedder::new();
-        let a = m.embed_one("same input").unwrap();
-        let b = m.embed_one("same input").unwrap();
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn mock_different_inputs_differ() {
-        let m = MockEmbedder::new();
-        let a = m.embed_one("alpha").unwrap();
-        let b = m.embed_one("bravo").unwrap();
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn mock_batch_matches_individual() {
-        let m = MockEmbedder::new();
-        let batch = m.embed_batch(&["x", "y"]).unwrap();
-        let single_x = m.embed_one("x").unwrap();
-        let single_y = m.embed_one("y").unwrap();
-        assert_eq!(batch[0], single_x);
-        assert_eq!(batch[1], single_y);
-    }
 
     #[test]
     fn fast_embedder_lazy_load() {

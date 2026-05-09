@@ -5,15 +5,25 @@
 
 ## [Unreleased]
 
-### Added (v0.3 in progress — Phase A complete)
+### Added (v0.3 in progress — Phase A + B complete)
+
+**Phase A — surprise rerank の honest limitations 解消**:
 - **`decay_floor` ranking parameter**（CLI `--decay-floor`、env `HIPPO_DECAY_FLOOR`、既定 0.5）— Bench B が v0.2 で surface した「365 日越え (12 half-lives) で `surprise·decay → 0` する一方で fresh chat の `surprise·1` が old high-importance Decision を demote する」失敗モードを構造的に解消。`max(decay(age, half_life), decay_floor)` で old item の surprise 寄与に下限を設定。Bench B 365d で **negative lift → +0.875 lift** にflip
 - **`--half-life-days` CLI**（env `HIPPO_HALF_LIFE_DAYS`、既定 30.0）— v0.2 でハードコードだった `DEFAULT_HALF_LIFE_DAYS = 30.0` をユーザ tunable 化。0 で decay 完全 disable
 - **`--oversample-factor` CLI**（env `HIPPO_OVERSAMPLE_FACTOR`、既定 6）— v0.2 既定 3 から bump。Bench A 既定で **precision@1 0.72 → 1.000** に。`MCP RecallParams.oversample_factor: Option<usize>` で per-call override も提供
 - `RankingConfig` 構造体 + `MemoryServer::new_with_config(...)` / `server::run_stdio_with_config(...)` — 上記 3 ノブを 1 か所にまとめた server-wide config
 - `RecallParams.oversample_factor: Option<usize>` を MCP schema に expose（v0.2 では `RecallOptions` 内のみで eval-only）
 
+**Phase B — External embedding backend**:
+- **`--embedding-backend {local,external}`** + **`--external-embedding-{url,model,api-key-env,timeout-ms,batch-size,max-retries}`** + 全対応 env (`HIPPO_EXTERNAL_EMBEDDING_*`)
+- `src/embeddings/` を module 化、新規 `external.rs` で OpenAI 互換 `/v1/embeddings` HTTP backend (reqwest + rustls-tls、L2 正規化強制、384 dim 検証 fail-loud、indexed re-order、429/5xx exponential backoff、batch chunking)
+- `EmbeddingBackendKind` enum + `EmbeddingFlags` clap 共有 struct で serve/embed/bench 全 subcommand に backend selector を追加
+- async-from-sync ブリッジ: `tokio::task::block_in_place` + `Handle::block_on` で MCP の sync Embedder trait を維持しつつ async reqwest を呼ぶ
+- 9 wiremock integration tests (`tests/external_embedding.rs`): happy path / dim mismatch / 401 fail-fast / 429 retry-then-succeed / 429 max-retries-exhausted / 5xx retry / batch chunk order preservation / concurrent embeds / un-normalized input → output normalized
+- `examples/external_embedding_smoke.rs` — OpenAI / Ollama / TEI / custom 4 種類の手動 smoke
+- `examples/bench_external_rss.rs` — wiremock in-process で **peak RSS = 25.7 MB** 実測（target <30 MB **MET**）。store p50 0.57 ms / retrieve p50 0.75 ms（ローカルmock基準）
+
 ### Planned (v0.3 残)
-- External embedding API backend (`--embedding-backend external`) — 設計済 (`docs/EXTERNAL_EMBEDDING.md`)、実装は Phase B
 - `prediction_loss` を OpenAI 互換 logprobs HTTP backend で実値化（abyo-llm-probe Rust crate 未存在のため Path 3、native candle-rs 移植は v0.4）
 - 多 MCP client 動作確認（Cursor / Continue / Aider）
 - Anthropic Memory Tool 互換レイヤ

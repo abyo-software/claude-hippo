@@ -1,14 +1,73 @@
 //! CLI — clap derive。serve / verify / embed / bench。
 
-use crate::embeddings::{Embedder, EmbeddingModelKind, FastEmbedder};
+use crate::embeddings::{
+    Embedder, EmbeddingBackendKind, EmbeddingModelKind, ExternalEmbedder, ExternalEmbeddingConfig,
+    FastEmbedder,
+};
 use crate::server::{
     RankingConfig, DEFAULT_DECAY_FLOOR, DEFAULT_HALF_LIFE_DAYS, DEFAULT_OVERSAMPLE_FACTOR,
 };
 use crate::surprise::SurpriseWeights;
-use crate::{server, storage, VERSION};
-use clap::{Parser, Subcommand};
+use crate::{server, storage, HippoError, VERSION};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// CLI flags shared by `serve` / `embed` / `bench` for choosing and configuring
+/// the embedding backend. `--embedding-backend external` activates the
+/// `--external-*` group; otherwise the local fastembed model (`--embedding-model`)
+/// is used.
+#[derive(Args, Debug, Clone)]
+struct EmbeddingFlags {
+    /// `local` (fastembed ONNX, default) or `external` (OpenAI-compatible HTTP).
+    #[arg(long, env = "HIPPO_EMBEDDING_BACKEND")]
+    embedding_backend: Option<String>,
+
+    /// Local model id (only used when --embedding-backend=local).
+    /// `minilm-l6-v2` (default, mcp-memory-service-rs と同 vector space) or
+    /// `bge-small-en-v15-q` (量子化、~33 MB)。Both are 384 dim.
+    #[arg(long, env = "HIPPO_EMBEDDING_MODEL")]
+    embedding_model: Option<String>,
+
+    /// External `/v1/embeddings`-compatible URL. Required when backend=external.
+    /// Examples: `https://api.openai.com/v1/embeddings`,
+    /// `http://localhost:11434/v1/embeddings` (Ollama).
+    #[arg(long, env = "HIPPO_EXTERNAL_EMBEDDING_URL")]
+    external_embedding_url: Option<String>,
+
+    /// External model name (e.g. `text-embedding-3-small`, `bge-m3`).
+    /// Required when backend=external.
+    #[arg(long, env = "HIPPO_EXTERNAL_EMBEDDING_MODEL")]
+    external_embedding_model: Option<String>,
+
+    /// Env var name to read the API key from. Default: `OPENAI_API_KEY`.
+    /// Use `NONE` to skip the `Authorization: Bearer …` header (e.g.
+    /// keyless local Ollama).
+    #[arg(long, env = "HIPPO_EXTERNAL_EMBEDDING_API_KEY_ENV")]
+    external_embedding_api_key_env: Option<String>,
+
+    /// Per-request timeout (ms). Default 5000.
+    #[arg(long, env = "HIPPO_EXTERNAL_EMBEDDING_TIMEOUT_MS")]
+    external_embedding_timeout_ms: Option<u64>,
+
+    /// Max texts per HTTP request before chunking. Default 64.
+    #[arg(long, env = "HIPPO_EXTERNAL_EMBEDDING_BATCH_SIZE")]
+    external_embedding_batch_size: Option<usize>,
+
+    /// Retries on 429/5xx/network. Default 3.
+    #[arg(long, env = "HIPPO_EXTERNAL_EMBEDDING_MAX_RETRIES")]
+    external_embedding_max_retries: Option<u32>,
+}
+
+impl EmbeddingFlags {
+    fn backend_kind(&self) -> anyhow::Result<EmbeddingBackendKind> {
+        match self.embedding_backend.as_deref() {
+            None => Ok(EmbeddingBackendKind::default()),
+            Some(s) => EmbeddingBackendKind::parse(s).map_err(|e| anyhow::anyhow!(e)),
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "hippo", version = VERSION,
@@ -35,11 +94,8 @@ enum Cmd {
         /// All in 0.0..=1.0, sum must be 1.0 (±1e-3). Default: `0.4,0.2,0.1,0.3`.
         #[arg(long, env = "HIPPO_SURPRISE_WEIGHTS")]
         surprise_weights: Option<String>,
-        /// Embedding model. `minilm-l6-v2` (default, mcp-memory-service-rs と
-        /// 同 vector space) or `bge-small-en-v15-q` (量子化、~33 MB)。
-        /// Both are 384 dim.
-        #[arg(long, env = "HIPPO_EMBEDDING_MODEL")]
-        embedding_model: Option<String>,
+        #[command(flatten)]
+        embed: EmbeddingFlags,
         /// Forgetting-curve half-life in days. Default 30. Lower = faster
         /// decay of old surprise. Set to 0 to disable decay.
         #[arg(long, env = "HIPPO_HALF_LIFE_DAYS")]
@@ -70,8 +126,8 @@ enum Cmd {
         text: String,
         #[arg(long, env = "HIPPO_MODEL_CACHE")]
         model_cache: Option<PathBuf>,
-        #[arg(long, env = "HIPPO_EMBEDDING_MODEL")]
-        embedding_model: Option<String>,
+        #[command(flatten)]
+        embed: EmbeddingFlags,
     },
     /// Run a quick self-bench: cold start + N store + N retrieve + RSS.
     Bench {
@@ -83,8 +139,8 @@ enum Cmd {
         model_cache: Option<PathBuf>,
         #[arg(long, env = "HIPPO_SURPRISE_WEIGHTS")]
         surprise_weights: Option<String>,
-        #[arg(long, env = "HIPPO_EMBEDDING_MODEL")]
-        embedding_model: Option<String>,
+        #[command(flatten)]
+        embed: EmbeddingFlags,
         #[arg(long, env = "HIPPO_HALF_LIFE_DAYS")]
         half_life_days: Option<f32>,
         #[arg(long, env = "HIPPO_DECAY_FLOOR")]
@@ -112,6 +168,83 @@ fn parse_model_kind(opt: Option<&str>) -> anyhow::Result<EmbeddingModelKind> {
     match opt {
         None => Ok(EmbeddingModelKind::default()),
         Some(s) => EmbeddingModelKind::parse(s).map_err(|e| anyhow::anyhow!(e)),
+    }
+}
+
+fn build_external_config(flags: &EmbeddingFlags) -> anyhow::Result<ExternalEmbeddingConfig> {
+    let url = flags.external_embedding_url.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--external-embedding-url is required when --embedding-backend=external \
+                 (or set HIPPO_EXTERNAL_EMBEDDING_URL)"
+        )
+    })?;
+    let model = flags.external_embedding_model.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--external-embedding-model is required when --embedding-backend=external \
+                 (or set HIPPO_EXTERNAL_EMBEDDING_MODEL)"
+        )
+    })?;
+    let key_env = flags
+        .external_embedding_api_key_env
+        .clone()
+        .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+    let api_key = if key_env.eq_ignore_ascii_case("none") || key_env.is_empty() {
+        String::new()
+    } else {
+        std::env::var(&key_env).unwrap_or_else(|_| {
+            tracing::warn!(
+                env = key_env.as_str(),
+                "external embedding api key env not set; sending request without Authorization \
+                 header (use `--external-embedding-api-key-env NONE` to silence)"
+            );
+            String::new()
+        })
+    };
+    Ok(ExternalEmbeddingConfig {
+        url,
+        model,
+        dim: crate::EMBEDDING_DIM,
+        api_key,
+        timeout: Duration::from_millis(flags.external_embedding_timeout_ms.unwrap_or(5_000)),
+        batch_size: flags.external_embedding_batch_size.unwrap_or(64),
+        max_retries: flags.external_embedding_max_retries.unwrap_or(3),
+    })
+}
+
+fn build_embedder_from_flags(
+    flags: &EmbeddingFlags,
+    model_cache: Option<PathBuf>,
+) -> anyhow::Result<Arc<dyn Embedder>> {
+    match flags.backend_kind()? {
+        EmbeddingBackendKind::Local => {
+            let model = parse_model_kind(flags.embedding_model.as_deref())?;
+            build_embedder(model_cache, model)
+        }
+        EmbeddingBackendKind::External => {
+            let cfg = build_external_config(flags)?;
+            let e = ExternalEmbedder::new(cfg).map_err(|e: HippoError| anyhow::anyhow!(e))?;
+            Ok(Arc::new(e))
+        }
+    }
+}
+
+fn embedding_backend_label(flags: &EmbeddingFlags) -> String {
+    match flags.backend_kind().unwrap_or_default() {
+        EmbeddingBackendKind::Local => {
+            let model = flags.embedding_model.as_deref().unwrap_or("minilm-l6-v2");
+            format!("local:{model}")
+        }
+        EmbeddingBackendKind::External => {
+            let url = flags
+                .external_embedding_url
+                .as_deref()
+                .unwrap_or("(missing-url)");
+            let model = flags
+                .external_embedding_model
+                .as_deref()
+                .unwrap_or("(missing-model)");
+            format!("external:{model}@{url}")
+        }
     }
 }
 
@@ -169,7 +302,16 @@ pub async fn run() -> anyhow::Result<()> {
         db: None,
         model_cache: None,
         surprise_weights: None,
-        embedding_model: None,
+        embed: EmbeddingFlags {
+            embedding_backend: None,
+            embedding_model: None,
+            external_embedding_url: None,
+            external_embedding_model: None,
+            external_embedding_api_key_env: None,
+            external_embedding_timeout_ms: None,
+            external_embedding_batch_size: None,
+            external_embedding_max_retries: None,
+        },
         half_life_days: None,
         decay_floor: None,
         oversample_factor: None,
@@ -182,7 +324,7 @@ pub async fn run() -> anyhow::Result<()> {
             db,
             model_cache,
             surprise_weights,
-            embedding_model,
+            embed,
             half_life_days,
             decay_floor,
             oversample_factor,
@@ -191,12 +333,12 @@ pub async fn run() -> anyhow::Result<()> {
             ensure_parent_dir(&path)?;
             let weights = parse_weights(surprise_weights.as_deref())?;
             let ranking = build_ranking_config(half_life_days, decay_floor, oversample_factor)?;
-            let model = parse_model_kind(embedding_model.as_deref())?;
+            let backend_label = embedding_backend_label(&embed);
             let store = storage::Storage::open(&path)?;
-            let embedder = build_embedder(model_cache, model)?;
+            let embedder = build_embedder_from_flags(&embed, model_cache)?;
             tracing::info!(
                 ?path,
-                model = model.as_str(),
+                backend = backend_label.as_str(),
                 ?weights,
                 ?ranking,
                 "claude-hippo serve starting (rmcp stdio)"
@@ -220,17 +362,17 @@ pub async fn run() -> anyhow::Result<()> {
         Cmd::Embed {
             text,
             model_cache,
-            embedding_model,
+            embed,
         } => {
-            let model = parse_model_kind(embedding_model.as_deref())?;
-            let embedder = build_embedder(model_cache, model)?;
+            let backend_label = embedding_backend_label(&embed);
+            let embedder = build_embedder_from_flags(&embed, model_cache)?;
             let t0 = std::time::Instant::now();
             let v = embedder.embed_one(&text)?;
             let dt = t0.elapsed();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             println!("hippo embed ✓");
             println!("  text     : {text:?}");
-            println!("  model    : {}", model.as_str());
+            println!("  backend  : {backend_label}");
             println!("  total    : {dt:?}");
             println!("  dim      : {}", v.len());
             println!("  L2 norm  : {norm:.6}");
@@ -242,15 +384,14 @@ pub async fn run() -> anyhow::Result<()> {
             db,
             model_cache,
             surprise_weights,
-            embedding_model,
+            embed,
             half_life_days,
             decay_floor,
             oversample_factor,
         } => {
             let weights = parse_weights(surprise_weights.as_deref())?;
             let ranking = build_ranking_config(half_life_days, decay_floor, oversample_factor)?;
-            let model = parse_model_kind(embedding_model.as_deref())?;
-            run_self_bench(n, db, model_cache, weights, ranking, model).await
+            run_self_bench(n, db, model_cache, weights, ranking, embed).await
         }
     }
 }
@@ -261,7 +402,7 @@ async fn run_self_bench(
     model_cache: Option<PathBuf>,
     weights: SurpriseWeights,
     ranking: RankingConfig,
-    model: EmbeddingModelKind,
+    embed_flags: EmbeddingFlags,
 ) -> anyhow::Result<()> {
     use std::time::Instant;
     let db_path = db.unwrap_or_else(|| {
@@ -273,10 +414,11 @@ async fn run_self_bench(
     // クリーンスタート
     let _ = std::fs::remove_file(&db_path);
 
+    let backend_label = embedding_backend_label(&embed_flags);
     let cold0 = Instant::now();
     let store = storage::Storage::open(&db_path)?;
-    let embedder = build_embedder(model_cache, model)?;
-    // first embed = model load
+    let embedder = build_embedder_from_flags(&embed_flags, model_cache)?;
+    // first embed = model load (local) / first request (external)
     let _ = embedder.embed_one("warmup")?;
     let cold = cold0.elapsed();
 
@@ -334,7 +476,7 @@ async fn run_self_bench(
     let rss_kb = read_self_rss_kb().unwrap_or(0);
 
     println!("claude-hippo self-bench ✓");
-    println!("  model    : {}", model.as_str());
+    println!("  backend  : {backend_label}");
     println!(
         "  weights  : outlier={:.2} engagement={:.2} explicit={:.2} prediction={:.2}",
         server.weights().w_outlier,

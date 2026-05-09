@@ -102,18 +102,23 @@ let surprise =
 
 **評価難度のリスク**：「賢く忘れる」の良さは既存ベンチでは出ない。独自評価軸（§6）と定性評価で証明する。
 
-### 軸2：Pure Rust 軽量（目標値、要実測）
+### 軸2：Pure Rust 軽量（実測検証済の競合数値あり）
 
-| 指標 | claude-hippo 目標 | mcp-memory-service-rs 実測 | Python 系（推定） |
-|------|------------------|--------------------------|------------------|
-| 起動時間（cold） | < 100 ms | **68 ms** | 1–3 s |
-| メモリ常駐 | **< 50 MB**（一段下） | 241 MB | 200–800 MB |
-| recall レイテンシ | < 5 ms | 8.8 ms (p50) | 10–100 ms |
-| store レイテンシ | < 5 ms | 8.5 ms (p50) | 10–100 ms |
+| 指標 | claude-hippo 目標 | mcp-memory-service-rs（公式 Apple Silicon） | mcp-memory-service-rs（本リポ Linux x86 実測） | Python 系（推定） |
+|------|------|------|------|------|
+| 起動時間（cold） | **< 100 ms** | 68 ms | 99 ms | 1–3 s |
+| **メモリ常駐** | **< 50 MB**（一段下） | 241 MB | **186 MB** | 200–800 MB |
+| recall レイテンシ p50 | < 5 ms | 8.8 ms | 5.5 ms | 10–100 ms |
+| store レイテンシ p50 | < 5 ms | 8.5 ms | 5.4 ms | 10–100 ms |
 
-> これらは **目標値**。`mcp-memory-service-rs` 数値は 2026-04 公式 README ベース（Apple Silicon、ONNX warm）。Sprint S1 で自前再計測し、未達なら正直に書く。
+> 本リポ Linux 実測値の詳細は [docs/COMPETITOR_BENCH.md](docs/COMPETITOR_BENCH.md) 参照。store/retrieve レイテンシは **Linux x86 のほうが Apple Silicon より速い**ことが分かった（warm 後の CPU クロック差）。
 >
-> 50MB 達成戦略：(a) ONNX Runtime を切って `candle` 純 Rust に倒すか、(b) `fastembed` を使いつつモデルを lazy load + idle 時 unload するか。Sprint S1 spike で `cargo bloat` + RSS 計測して判断。
+> **<50 MB 達成戦略**：`cargo bloat` で **ONNX Runtime（ort_sys + 周辺）が binary の 74% を占有**することが判明。これが ~150 MB 常駐の主因。達成パスは:
+> - (a) **candle 純 Rust に倒す**（ort 系を全部切る、自前 BertModel 実装が必要、binary は ~18 MB に縮む）
+> - (b) `fastembed` のまま **lazy load + idle unload**（cold-start は 23 MB を維持、最初の embed で 173 MB ジャンプ）
+> - (c) **External embedding API**（OpenAI/HF/Ollama 経由、binary <20 MB / RSS <30 MB だがネットワーク必須）
+>
+> Sprint S1 spike で (a)(b) のプロトを作って RSS 計測 → 採用判断。
 
 ### 軸3：abyo 既存資産との統合
 
@@ -394,9 +399,9 @@ abyo-llm-probe + abyo-speculate + claude-hippo の 3 点で「ローカル LLM �
 - [ ] **今週中（〜2026-05-16）**: crates.io に `claude-hippo` v0.0.1 placeholder を publish（squat 防止）
 - [ ] **今週中（〜2026-05-16）**: crates.io に `abyo-hippo` v0.0.1 placeholder を publish（防御）
 - [ ] **今週中（〜2026-05-16）**: GitHub リポジトリ作成 `abyo-software/claude-hippo`（README に「Sprint S1 着手予定」だけ書く）
-- [ ] Sprint S1 直前: `mcp-memory-service-rs` を実機 clone + `cargo build` + ベンチ再現（68ms / 241MB を自手元で確認）
-- [ ] Sprint S1 直前: `mcp-memory-service` (Python) と MemCP の docker / pip インストールでベンチ環境を整備
-- [ ] Sprint S1 直前: SHODH spec OpenAPI を読み込んで schema 互換性の差分を `docs/SHODH_COMPAT.md` にメモ
+- [x] Sprint S1 直前: `mcp-memory-service-rs` を実機 clone + `cargo build` + ベンチ再現（Linux x86 で cold 99ms / store 5.4ms / retrieve 5.5ms / RSS 186MB を計測、[docs/COMPETITOR_BENCH.md](docs/COMPETITOR_BENCH.md)）
+- [ ] Sprint S1 直前: `mcp-memory-service` (Python) と MemCP の docker / pip インストールでベンチ環境を整備（claude-hippo Sprint S1 で並走）
+- [x] Sprint S1 直前: SHODH spec OpenAPI 読解 + schema 互換性差分を [docs/SHODH_COMPAT.md](docs/SHODH_COMPAT.md) に記載
 - [x] §10 オープン質問の決着（本ドキュメントで完了）
 - [x] MCP SDK 最新版確認（rmcp 1.6.x で確定）
 - [x] 埋め込み比較（fastembed 5.13.x で確定、candle は runner-up）

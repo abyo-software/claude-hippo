@@ -14,8 +14,10 @@
 pub mod cli;
 pub mod embeddings;
 pub mod error;
+pub mod memory_tool;
 pub mod prediction_loss;
 pub mod server;
+pub mod shodh_rest;
 pub mod storage;
 pub mod surprise;
 

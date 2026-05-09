@@ -9,6 +9,7 @@
 //! - `ping`: health probe (vec_version, memory_count を返す)
 
 use crate::embeddings::Embedder;
+use crate::memory_tool::{self, MemoryToolParams};
 use crate::prediction_loss::PredictionLossBackend;
 use crate::storage::{self, MemoryRow, Storage};
 use crate::surprise::{self, SurpriseComponents, SurpriseWeights};
@@ -82,6 +83,9 @@ pub struct MemoryServer {
     /// Optional backend for filling `SurpriseComponents.prediction_loss`.
     /// `None` falls back to the v0.2 redistribution behavior.
     prediction_loss: Option<Arc<dyn PredictionLossBackend>>,
+    /// When true, the `memory` tool (Anthropic Memory Tool compat) is
+    /// active. Default false — opt in via `--anthropic-memory-tool`.
+    enable_memory_tool: bool,
     weights: SurpriseWeights,
     ranking: RankingConfig,
     started_at: std::time::Instant,
@@ -263,11 +267,26 @@ impl MemoryServer {
         weights: SurpriseWeights,
         ranking: RankingConfig,
     ) -> Self {
+        Self::new_full_with_memory_tool(storage, embedder, prediction_loss, weights, ranking, false)
+    }
+
+    /// Most-explicit constructor. Adds the `enable_memory_tool` flag for
+    /// the v0.3 Anthropic Memory Tool compatibility layer. Default off
+    /// (CLI surface: `--anthropic-memory-tool`).
+    pub fn new_full_with_memory_tool(
+        storage: Storage,
+        embedder: Arc<dyn Embedder>,
+        prediction_loss: Option<Arc<dyn PredictionLossBackend>>,
+        weights: SurpriseWeights,
+        ranking: RankingConfig,
+        enable_memory_tool: bool,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             storage: Arc::new(Mutex::new(storage)),
             embedder,
             prediction_loss,
+            enable_memory_tool,
             weights,
             ranking,
             started_at: std::time::Instant::now(),
@@ -284,6 +303,10 @@ impl MemoryServer {
 
     pub fn has_prediction_loss_backend(&self) -> bool {
         self.prediction_loss.is_some()
+    }
+
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
     }
 
     /// **Tests / advanced use only.** Returns the underlying storage Arc for
@@ -422,6 +445,29 @@ impl MemoryServer {
         Parameters(p): Parameters<SessionSummaryParams>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
         self.do_session_summary(p).await
+    }
+
+    #[tool(
+        name = "memory",
+        description = "Anthropic Memory Tool compatibility surface (v0.3, opt-in via \
+                       --anthropic-memory-tool). Filesystem-shaped operations (view / create / \
+                       str_replace / insert / delete / rename) under /memories. Returns plain \
+                       text matching Anthropic's documented response format. When the flag is \
+                       off, returns an instructional error."
+    )]
+    async fn memory(
+        &self,
+        Parameters(p): Parameters<MemoryToolParams>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        if !self.enable_memory_tool {
+            return Err(invalid_input(
+                "memory tool not enabled. Restart `hippo serve --anthropic-memory-tool` to \
+                 expose the Anthropic Memory Tool compatibility surface.",
+            ));
+        }
+        let mut store = self.storage.lock().await;
+        let reply = memory_tool::dispatch(&mut store, p);
+        Ok(CallToolResult::success(vec![Content::text(reply.content)]))
     }
 }
 
@@ -802,7 +848,26 @@ pub async fn run_stdio_full(
     weights: SurpriseWeights,
     ranking: RankingConfig,
 ) -> anyhow::Result<()> {
-    let server = MemoryServer::new_full(storage, embedder, prediction_loss, weights, ranking);
+    run_stdio_full_with_memory_tool(storage, embedder, prediction_loss, weights, ranking, false)
+        .await
+}
+
+pub async fn run_stdio_full_with_memory_tool(
+    storage: Storage,
+    embedder: Arc<dyn Embedder>,
+    prediction_loss: Option<Arc<dyn PredictionLossBackend>>,
+    weights: SurpriseWeights,
+    ranking: RankingConfig,
+    enable_memory_tool: bool,
+) -> anyhow::Result<()> {
+    let server = MemoryServer::new_full_with_memory_tool(
+        storage,
+        embedder,
+        prediction_loss,
+        weights,
+        ranking,
+        enable_memory_tool,
+    );
     let service = server
         .serve(stdio())
         .await

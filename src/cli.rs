@@ -171,6 +171,25 @@ enum Cmd {
         /// override is also exposed via `RecallParams.oversample_factor`.
         #[arg(long, env = "HIPPO_OVERSAMPLE_FACTOR")]
         oversample_factor: Option<usize>,
+        /// Expose the Anthropic Memory Tool compatibility surface (a
+        /// filesystem-shaped `memory` MCP tool with view/create/str_replace/
+        /// insert/delete/rename commands under `/memories`). Off by default
+        /// because the canonical surprise-aware API is `hippo_*`. See
+        /// `docs/MEMORY_TOOL_COMPAT.md`.
+        #[arg(long, env = "HIPPO_ANTHROPIC_MEMORY_TOOL")]
+        anthropic_memory_tool: bool,
+        /// Also start a SHODH OpenAPI v1.0.0-compatible REST server on
+        /// `--shodh-rest-bind` (default 127.0.0.1:8765). Coexists with the
+        /// MCP stdio transport in the same process. v0.3 implements 6 of
+        /// the 13 SHODH endpoints; the rest return 501 with a clear
+        /// pointer to the MCP tools.
+        #[arg(long, env = "HIPPO_SHODH_REST")]
+        shodh_rest: bool,
+        /// REST bind address. Default `127.0.0.1:8765`. Use a reverse
+        /// proxy for TLS in production — claude-hippo does not terminate
+        /// TLS on this surface.
+        #[arg(long, env = "HIPPO_SHODH_REST_BIND")]
+        shodh_rest_bind: Option<String>,
     },
     /// Open the database, apply schema, verify sqlite-vec, print stats.
     /// Does not read/write any memories. Safe against a live DB.
@@ -445,6 +464,9 @@ pub async fn run() -> anyhow::Result<()> {
         half_life_days: None,
         decay_floor: None,
         oversample_factor: None,
+        anthropic_memory_tool: false,
+        shodh_rest: false,
+        shodh_rest_bind: None,
     });
 
     storage::register_sqlite_vec();
@@ -459,6 +481,9 @@ pub async fn run() -> anyhow::Result<()> {
             half_life_days,
             decay_floor,
             oversample_factor,
+            anthropic_memory_tool,
+            shodh_rest,
+            shodh_rest_bind,
         } => {
             let path = db.unwrap_or_else(default_db_path);
             ensure_parent_dir(&path)?;
@@ -473,11 +498,23 @@ pub async fn run() -> anyhow::Result<()> {
                 ?path,
                 backend = backend_label.as_str(),
                 prediction_loss = pl_label.as_str(),
+                anthropic_memory_tool,
+                shodh_rest,
                 ?weights,
                 ?ranking,
                 "claude-hippo serve starting (rmcp stdio)"
             );
-            server::run_stdio_full(store, embedder, pl_backend, weights, ranking).await
+            run_serve_with_optional_rest(
+                store,
+                embedder,
+                pl_backend,
+                weights,
+                ranking,
+                anthropic_memory_tool,
+                shodh_rest,
+                shodh_rest_bind,
+            )
+            .await
         }
         Cmd::Verify { db } => {
             let path = db.unwrap_or_else(default_db_path);
@@ -529,6 +566,58 @@ pub async fn run() -> anyhow::Result<()> {
             run_self_bench(n, db, model_cache, weights, ranking, embed, prediction).await
         }
     }
+}
+
+/// Choose between MCP stdio and SHODH REST as the primary transport.
+///
+/// v0.3 design: a single `hippo serve` process exposes ONE transport. To
+/// run both in the same machine, launch two processes — they share the
+/// same SQLite DB file via WAL and SQLite's in-process locking handles
+/// concurrency. Doing in-process dual-serve would require either cloning
+/// the embedder/storage state across two separate `MemoryServer` instances
+/// or refactoring rmcp's owned-`self` `serve()` signature; both are scoped
+/// to v0.4.
+#[allow(clippy::too_many_arguments)]
+async fn run_serve_with_optional_rest(
+    store: storage::Storage,
+    embedder: Arc<dyn Embedder>,
+    pl_backend: Option<Arc<dyn PredictionLossBackend>>,
+    weights: SurpriseWeights,
+    ranking: RankingConfig,
+    enable_memory_tool: bool,
+    shodh_rest: bool,
+    shodh_rest_bind: Option<String>,
+) -> anyhow::Result<()> {
+    if !shodh_rest {
+        return server::run_stdio_full_with_memory_tool(
+            store,
+            embedder,
+            pl_backend,
+            weights,
+            ranking,
+            enable_memory_tool,
+        )
+        .await;
+    }
+    let bind: std::net::SocketAddr = shodh_rest_bind
+        .as_deref()
+        .unwrap_or("127.0.0.1:8765")
+        .parse()
+        .map_err(|e| anyhow::anyhow!("--shodh-rest-bind invalid socket addr: {e}"))?;
+    let mem_server = Arc::new(server::MemoryServer::new_full_with_memory_tool(
+        store,
+        embedder,
+        pl_backend,
+        weights,
+        ranking,
+        enable_memory_tool,
+    ));
+    tracing::info!(
+        ?bind,
+        "claude-hippo serving SHODH REST only (no stdio MCP). Run a second \
+         `hippo serve` process to expose stdio MCP alongside (they share the SQLite DB)."
+    );
+    crate::shodh_rest::serve(mem_server, bind).await
 }
 
 async fn run_self_bench(

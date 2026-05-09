@@ -2,23 +2,26 @@
 
 | 項目 | 値 |
 |---|---|
-| Status | Draft v0.2（推敲版） |
+| Status | Draft v0.3（オープン質問全決着版） |
 | Updated | 2026-05-09 |
 | Author | Youichi / abyo software, LLC |
 | Repo (予約) | `github.com/abyo-software/claude-hippo` |
-| Crate (予約) | `hippo`, `claude-hippo` |
-| Command | `hippo` |
-| License | Apache-2.0 / MIT dual |
+| Crate (確定) | `claude-hippo`（primary）, `abyo-hippo`（防御）。`hippo`/`hippocampus` は他者保有のため断念 |
+| Command | `hippo`（binary 名は crate 名と独立） |
+| License | Apache-2.0 / MIT dual（mcp-memory-service-rs の PolyForm NC に対する商用フリーポジション） |
+| MCP SDK | `rmcp` 1.6.x（Anthropic 公式 Tier 2、9.46M DL、daily merges） |
+| 埋め込み | `fastembed` 5.13.x（30+ モデル enum、ort 自動同梱） |
 
 ---
 
 ## TL;DR（60秒）
 
-Claude Code に **海馬（hippocampus）** を足す MCP サーバ。全部覚える代わりに、**特異性が高い瞬間だけ**を長期記憶化する。Pure Rust 単一バイナリで起動 100ms 以下を目標、ローカル動作、Anthropic Memory Tool との互換レイヤを持つ。差別化は 3 軸：
+Claude Code に **海馬（hippocampus）** を足す MCP サーバ。全部覚える代わりに、**特異性が高い瞬間だけ**を長期記憶化する。Pure Rust 単一バイナリで起動 100ms 以下・常駐 50MB 以下を目標、ローカル動作、Anthropic Memory Tool / SHODH spec の互換レイヤを持つ。差別化は 4 軸：
 
 1. **Surprise-based selection**（人間の海馬模倣、abyo-recall 哲学の継承）
-2. **Pure Rust 高速**（Python 系 MCP memory に対する起動時間・メモリ常駐優位）
+2. **Pure Rust 軽量**（Python 系に対する優位は当然として、唯一の Rust 競合 `mcp-memory-service-rs` の 241MB RSS に対しても <50MB を狙う）
 3. **abyo software 既存資産との統合**（probe / speculate / filters）
+4. **Apache-2.0 / MIT dual ライセンス**（`mcp-memory-service-rs` は PolyForm Noncommercial で商用クローズド → claude-hippo は商用フリー版のポジション）
 
 直接収益はゼロ前提、abyo software ブランド構築 + Youichi 自身のペイン解決 + Ferro 売却バリュエーション補強の三重投資。
 
@@ -32,7 +35,8 @@ Claude Code 用 memory MCP は既に競合多数。素朴に「Rust で書きま
 
 | 競合 | 言語 | 特徴 | 弱点（推定） |
 |------|------|------|-------------|
-| mcp-memory-service (doobidoo) | Python | 25+ AI app 対応、Cloudflare 同期、ナレッジグラフ可視化 | Python、汎用、特化なし |
+| **mcp-memory-service-rs (doobidoo)** ⚠️ | **Rust** | **直接競合**。SHODH 互換 schema、cold-start 68ms、RSS 241MB、`rmcp` 1.5 採用、M0 scaffold 段階（2026-04 リリース、★2） | **PolyForm Noncommercial** で商用閉鎖、特異性選別なし、abyo 統合なし |
+| mcp-memory-service (doobidoo) | Python | 25+ AI app 対応、Cloudflare 同期、ナレッジグラフ可視化、SHODH spec オリジン | Python、汎用、特化なし |
 | MemPalace | Python | ChromaDB ベース、LongMemEval ベンチで話題 | Issue #27 にアーキ批判、ベンチが vector store 由来との指摘 |
 | MemCP | Python | `/compact` フック、自動グラフ、トークン削減主張 | Python、デバッグツール寄り |
 | mcp-memory-keeper (mkreyman) | TypeScript | Claude Code 特化、SQLite、シンプル | 機能が限定的 |
@@ -40,19 +44,24 @@ Claude Code 用 memory MCP は既に競合多数。素朴に「Rust で書きま
 | claude-memory-mcp (WhenMoon-afk) | Python | Tiered memory、Docker | 機能が素朴 |
 | Anthropic Memory Tool（公式） | - | beta、公式ロードマップで進行中 | 仕様未確定、特異性選別なし |
 
-> 競合の数値（メモリ常駐、起動時間）は記事・README ベースの推定値であり、Sprint S1 の比較ベンチで自前計測する。
+> 競合の数値（メモリ常駐、起動時間）は README ベース。`mcp-memory-service-rs` の 68ms / 241MB は公式ベンチ実測値（Apple Silicon）。Sprint S1 で自前再計測する。
+
+### SHODH spec とは
+**Shodh Unified Memory API Specification v1.0.0**（[varun29ankuS/shodh-memory](https://github.com/varun29ankuS/shodh-memory)）。サンスクリット語「शोध（探究）」由来。emotional metadata（valence / arousal）、episodic memory（episode_id, sequence_number）、source credibility scoring を含む memory schema 仕様。doobidoo/mcp-memory-service が公式準拠。互換性確保で SQLite ファイルレベルの swap が可能になる。
 
 ### 既に解かれている部分には踏み込まない
 
 - ベクトル検索の精度競争（Mem0/MemPalace に分がある）
 - ナレッジグラフ可視化（mcp-memory-service が先行）
 - 多 client 対応（mcp-memory-service が 25+ で先行）
+- 「Python から Rust へ書き換えただけ」の差別化（`mcp-memory-service-rs` が先着）
 
 ### 勝負する領域
 
-- **長期セッションでの想起精度**（特異性選別が効く）
-- **起動時間 / メモリ常駐**（Pure Rust の物理優位）
+- **長期セッションでの想起精度**（特異性選別が効く、`mcp-memory-service-rs` にもない）
+- **常駐メモリの一段下**（mcp-memory-service-rs 241MB → claude-hippo <50MB を狙う。ONNX を切るか lazy load で達成）
 - **LLM 内部状態を活かした surprise 推定**（abyo-llm-probe があるからできる）
+- **商用フリー license**（PolyForm NC な mcp-memory-service-rs の代替）
 
 ---
 
@@ -93,15 +102,18 @@ let surprise =
 
 **評価難度のリスク**：「賢く忘れる」の良さは既存ベンチでは出ない。独自評価軸（§6）と定性評価で証明する。
 
-### 軸2：Pure Rust 高速（目標値、要実測）
+### 軸2：Pure Rust 軽量（目標値、要実測）
 
-| 指標 | claude-hippo 目標 | Python 系（推定） |
-|------|------------------|------------------|
-| 起動時間（cold） | < 100 ms | 1–3 s |
-| メモリ常駐 | < 50 MB | 200–800 MB |
-| recall レイテンシ | < 5 ms | 10–100 ms |
+| 指標 | claude-hippo 目標 | mcp-memory-service-rs 実測 | Python 系（推定） |
+|------|------------------|--------------------------|------------------|
+| 起動時間（cold） | < 100 ms | **68 ms** | 1–3 s |
+| メモリ常駐 | **< 50 MB**（一段下） | 241 MB | 200–800 MB |
+| recall レイテンシ | < 5 ms | 8.8 ms (p50) | 10–100 ms |
+| store レイテンシ | < 5 ms | 8.5 ms (p50) | 10–100 ms |
 
-> これらは **目標値**。Sprint S1 で自前計測し、未達なら正直に書く。
+> これらは **目標値**。`mcp-memory-service-rs` 数値は 2026-04 公式 README ベース（Apple Silicon、ONNX warm）。Sprint S1 で自前再計測し、未達なら正直に書く。
+>
+> 50MB 達成戦略：(a) ONNX Runtime を切って `candle` 純 Rust に倒すか、(b) `fastembed` を使いつつモデルを lazy load + idle 時 unload するか。Sprint S1 spike で `cargo bloat` + RSS 計測して判断。
 
 ### 軸3：abyo 既存資産との統合
 
@@ -110,6 +122,12 @@ let surprise =
 - **abyo-filters**：メモリ存在判定（probabilistic filter）で空間効率改善
 
 これは他社に複製困難な濠。ただし v0.1 では abyo 統合 **なし** で動くこと。abyo 側が遅延しても claude-hippo は止まらない設計（§9 リスク5）。
+
+### 軸4：Apache-2.0 / MIT dual ライセンス（戦略軸）
+
+唯一の Rust 直接競合 `mcp-memory-service-rs` は **PolyForm Noncommercial 1.0.0**（商用は別契約、henry.krupp@gmail.com 連絡）。エンタープライズ・スタートアップ・コンサル等の商用ユーザは事実上排除されている。claude-hippo は Apache/MIT デュアル → **「商用フリーで使える唯一の Rust 製 SHODH 互換 memory MCP」** という言い切れるポジション。
+
+これは技術差別化ではなく **法務差別化**。HN ブログでも「PolyForm vs Apache/MIT」の対比を前面に出す。
 
 ---
 
@@ -133,17 +151,28 @@ let surprise =
 - `hippo_remember(content, tags, importance?)` — 明示保存
 - `hippo_recall(query, limit?)` — 関連記憶取り出し
 - `hippo_list_recent(n?)` — 直近一覧
-- `hippo_forget(id)` — 削除
+- `hippo_forget(id)` — 削除（soft-delete、SHODH 互換のため tombstone 残す）
 - `hippo_session_summary()` — セッション要約
+
+設計原則 — **storage と retrieval を分離**：
+- **保存**は常にフル（surprise score を column として attach）。法務派ユーザの audit trail を確保
+- **取り出し**は surprise-weighted ranking がデフォルト ON、threshold 設定可能
+- 「忘れる」は物理削除に紐付けず、recall ランキング下げ + decay model で表現
+- これで「全保存モード派 vs 特異性選別派」の対立を解消（§10 (8) の決定）
 
 実装範囲（未着手）：
 
-- [ ] MCP プロトコル（公式 Rust SDK or rust-mcp 系を選定）
-- [ ] SQLite (rusqlite) による記憶ストア
-- [ ] FastEmbed or candle によるローカル埋め込み
-- [ ] ベクトル検索（HNSW、後で abyo-filters 連携）
-- [ ] Claude Code 統合の動作確認
-- [ ] 比較ベンチ基盤（vs mcp-memory-keeper, MemCP）
+- [ ] MCP プロトコル：`rmcp` 1.6.x（features: `server`, `macros`, `transport-io`）
+- [ ] SQLite：`rusqlite` 0.39 (bundled) + `sqlite-vec` 0.1（mcp-memory-service-rs と同 schema で互換性確保）
+- [ ] ローカル埋め込み：`fastembed` 5.13.x（モデルは BGE-small-en-v1.5 デフォルト、`UserDefinedEmbeddingModel` で同梱パス対応）
+- [ ] ベクトル検索：sqlite-vec で KNN、`memories.deleted_at IS NOT NULL LIMIT 1` 条件付き oversample（mcp-memory-service-rs の最適化を踏襲）
+- [ ] Claude Code 統合の動作確認（`npx @modelcontextprotocol/inspector cargo run` で smoke test）
+- [ ] 比較ベンチ基盤（vs mcp-memory-service-rs, mcp-memory-service Python, mcp-memory-keeper, MemCP）
+
+> S1 spike 注意点（埋め込み調査 agent からの finding）：
+> 1. `ort` dylib のクロスコンパイル → CI matrix を `macos-14`（arm64）と `ubuntu-latest` で分割
+> 2. モデル weight の vendoring vs runtime DL → `~/.cache/claude-hippo/models/` キャッシュ + fallback DL
+> 3. `tokenizers` の `onig` feature → CI に C コンパイラ必須、Alpine musl で詰む
 
 ### v0.2 Surprise-based Selection（Sprint S2, 5–7 日）
 
@@ -174,18 +203,21 @@ let surprise =
 
 > 数値は **目標 / 推定**。Sprint S1 の自前ベンチで上書きする。
 
-| 機能 | claude-hippo | mcp-memory-service | MemPalace | MemCP | mcp-memory-keeper |
-|------|--------------|--------------------|-----------|-------|-------------------|
-| 言語 | **Rust** | Python | Python | Python | TypeScript |
-| 起動時間 | **<100ms (目標)** | 1–3s | 1–3s | 1–3s | <500ms |
-| メモリ常駐 | **<50MB (目標)** | 200–500MB | 300–800MB | 200–400MB | <100MB |
-| 特異性ベース選別 | **⭕** | ❌ | ❌ | ❌ | ❌ |
-| Forgetting curve | **⭕** | ❌ | ❌ | △ | ❌ |
-| ローカル動作 | ⭕ | ⭕ | ⭕ | ⭕ | ⭕ |
-| Cloudflare 同期 | △ (将来) | ⭕ | ❌ | ❌ | ❌ |
-| ナレッジグラフ | △ (v0.3+) | ⭕ | ⭕ | ⭕ | ❌ |
-| 多 MCP client | ⭕ | ⭕⭕ (25+) | ⭕ | ⭕ | △ |
-| LLM 内部状態活用 | **⭕** | ❌ | ❌ | ❌ | ❌ |
+| 機能 | claude-hippo | mcp-memory-service-rs | mcp-memory-service | MemPalace | MemCP | mcp-memory-keeper |
+|------|--------------|----------------------|--------------------|-----------|-------|-------------------|
+| 言語 | **Rust** | Rust | Python | Python | Python | TypeScript |
+| 起動時間 | **<100ms (目標)** | 68ms (実測) | 3.6s (実測) | 1–3s | 1–3s | <500ms |
+| メモリ常駐 | **<50MB (目標)** | 241MB (実測) | 561MB (実測) | 300–800MB | 200–400MB | <100MB |
+| ライセンス | **Apache/MIT** | PolyForm NC | Apache-2.0 | — | — | MIT |
+| 商用利用 | **⭕ 自由** | ❌ 別契約必要 | ⭕ | ⭕ | ⭕ | ⭕ |
+| 特異性ベース選別 | **⭕** | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Forgetting curve / decay | **⭕** | ❌ | ❌ | ❌ | △ | ❌ |
+| SHODH spec 互換 | **⭕ (v0.3)** | ⭕ | ⭕ (origin) | ❌ | ❌ | ❌ |
+| ローカル動作 | ⭕ | ⭕ | ⭕ | ⭕ | ⭕ | ⭕ |
+| Cloudflare 同期 | △ (v1.x) | ❌ | ⭕ | ❌ | ❌ | ❌ |
+| ナレッジグラフ | △ (v0.3+) | ❌ | ⭕ | ⭕ | ⭕ | ❌ |
+| 多 MCP client | ⭕ | ⭕ | ⭕⭕ (25+) | ⭕ | ⭕ | △ |
+| LLM 内部状態活用 | **⭕** | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ---
 
@@ -219,8 +251,16 @@ LongMemEval 等の既存ベンチでは負ける前提。「**特異性ベース
 
 ## 7. ネーミング
 
-### claude-hippo / hippo
-**hippocampus**（海馬）の親しみやすい愛称。比喩が一発で伝わる、HN タイトルが書ける、覚えやすい、二番煎じが作りにくい。
+### crate / binary 名（2026-05-09 確定）
+- **crate primary**: `claude-hippo`（AVAILABLE 確認済、今週中に v0.0.1 placeholder で予約）
+- **crate 防御**: `abyo-hippo`（AVAILABLE 確認済、同上）
+- **binary**: `hippo`（crate 名と独立、衝突なし）
+- **断念**:
+  - `hippo` → 2021 年公開の web asset preprocessor（max_version 0.1.1, downloads 1664）が保有。squat ではないため negotiate 困難
+  - `hippocampus` → 2026-01-21 に b0xtch が `Hello, world!` 中身で squat（github.com/b0xtch/hippo）。同コンセプト名のため不快だが、争わず無視
+
+### コンセプト
+**hippocampus**（海馬）の親しみやすい愛称。比喩が一発で伝わる、HN タイトルが書ける、覚えやすい。`claude-hippo` は「Claude 専用の海馬」と読めて MCP サーバの所属が明確。
 
 ### マスコット
 カバの「Hippo」キャラクター。イラスト、ブログアイコン、エラーメッセージのキャラ化等。
@@ -251,26 +291,28 @@ abyo-llm-probe + abyo-speculate + claude-hippo の 3 点で「ローカル LLM �
 
 | # | リスク | 確率 | 影響 | 対策 |
 |---|--------|------|------|------|
-| R1 | Anthropic 公式 Memory Tool が claude-hippo の差別化を消す | 中 | 大 | 公式互換レイヤを最初から提供。公式が手を出さない領域（特異性選別、Pure Rust 高速）に集中 |
-| R2 | Python 系競合が Cloudflare 同期等で先行進化 | 高 | 中 | SHODH 風の互換仕様を v0.3 で対応（仕様の正式名称は要確認）。速度差は埋められない優位 |
+| R1 | Anthropic 公式 Memory Tool が claude-hippo の差別化を消す | 中 | 大 | 公式互換レイヤを v0.3 で提供。公式が手を出さない領域（特異性選別、Pure Rust 軽量、abyo 統合）に集中 |
+| R2 | Python 系競合が Cloudflare 同期等で先行進化 | 高 | 中 | **SHODH Unified Memory API Spec v1.0.0** に v0.3 で公式準拠（emotional metadata + episodic memory + source credibility）。SQLite ファイルレベル swap で乗り換え動線を確保。Cloudflare 同期は doobidoo の `shodh-cloudflare` に乗っかる |
 | R3 | 「特異性選別」の良さが既存ベンチで数値化できない | 高 | 中 | 独自評価軸 + 10 人ヒューマン評価 + ブログで定性評価多用 |
-| R4 | 「全部覚えてくれ」派ユーザの拒絶（特に法務・規制） | 中 | 中 | デフォルトは全保存 + 重要度スコア付与。「全保存モード」を Pro 機能化 |
+| R4 | 「全部覚えてくれ」派ユーザの拒絶（特に法務・規制） | 中 | 中 | §4 設計で解決済：storage は常にフル、retrieval が surprise-weighted。物理削除は soft-delete のみ |
 | R5 | abyo-llm-probe / abyo-speculate の遅延がコア差別化を遅らせる | 中 | 大 | v0.1 は abyo 統合 **なし** で完全動作。abyo 統合は v0.2/v0.3 でオプション機能 |
-| R6 | MCP プロトコル変化に追従コスト | 低 | 小 | 公式 SDK を使い、自前実装しない |
+| R6 | MCP プロトコル変化に追従コスト | 低 | 小 | `rmcp` 1.6.x（Anthropic 公式 Tier 2、daily merges、v1.0 GA 済）を使い、自前実装しない |
 | R7 | Youichi 1 人の手数（probe / speculate / FerroSearch / hippo 並走不可） | 高 | 大 | claude-hippo は abyo-speculate Phase 1 完了後に着手。dogfooding で Claude Code 自身に書かせる |
+| **R8** | **`mcp-memory-service-rs` が先に traction を獲得し「Rust の選択肢」枠を埋める** | 中 | 大 | 4 軸差別化を全面展開：(a) 特異性選別、(b) RSS 50MB（vs 241MB）、(c) abyo 統合、(d) **Apache/MIT 商用フリー（vs PolyForm NC）**。HN ブログでは正面から名指しで対比、誠実さで認知奪取 |
+| **R9** | **`hippocampus` crate squat（b0xtch、2026-01）の絡みでブランド混乱** | 低 | 小 | 名前空間は `claude-hippo` / `abyo-hippo` で確定（§7）。`hippocampus` は争わず無視 |
 
 ---
 
-## 10. オープン質問（着手前に決める）
+## 10. オープン質問（2026-05-09 決着）
 
-- [ ] MCP SDK は公式 Rust SDK か `rust-mcp` 系か。最新版調査必要
-- [ ] ローカル埋め込みは FastEmbed (Rust port) か candle か。バイナリサイズと依存性で判断
-- [ ] §9 R2 の「SHODH 仕様」は正式には何の仕様か。mcp-memory-service の互換 spec と思われるが要確認
-- [ ] abyo-recall 哲学のドキュメント（surprise based selection の理論的根拠）を別ファイルに切り出すか
-- [ ] crates.io 名前空間（`hippo` / `claude-hippo` / `abyo-hippo` / `hippocampus`）の予約タイミング
-- [ ] ライセンスは Apache-2.0 / MIT dual で確定か（abyo software 他リポと整合）
-- [ ] Cloudflare 同期は v0.3 でやるか v1.x で先送りか
-- [ ] 「全保存モード」のデフォルト ON / OFF はどちらか
+- [x] **(1) MCP SDK** → `rmcp` 1.6.x（Anthropic 公式 Tier 2、9.46M cumulative DL、daily merges、v1.0 GA 済、SEP 取り込み継続）。`rust-mcp-sdk` は OAuth プロバイダー連携が必要になった場合の runner-up。自前実装は仕様改版追従コストで論外
+- [x] **(2) ローカル埋め込み** → `fastembed` 5.13.x（30+ モデル enum、ort 自動 fetch + 同梱、5 行で動く）。RSS <50MB が達成不能と判明したら candle 純 Rust に乗り換え（Sprint S1 spike で判断）
+- [x] **(3) SHODH 仕様** → **Shodh Unified Memory API Specification v1.0.0**（[varun29ankuS/shodh-memory](https://github.com/varun29ankuS/shodh-memory)、サンスクリット「探究」由来）。emotional metadata、episodic memory、source credibility scoring を含む。doobidoo/mcp-memory-service が公式準拠。**v0.3 で claude-hippo も準拠**して SQLite swap を可能に
+- [x] **(4) abyo-recall 哲学のドキュメント分離** → **別ファイル化**。Sprint S2 着手時に `docs/SURPRISE_SELECTION.md` を作成、v0.2 実装と並走で肉付け（§11 タスクに追加）。差別化軸の核なので、外部に説明可能な独立ドキュメントを持つ
+- [x] **(5) crates.io 名前空間予約** → **今週中（〜2026-05-16）に `claude-hippo` v0.0.1 と `abyo-hippo` v0.0.1 placeholder を publish**。`hippo`（2021 web preprocessor）と `hippocampus`（2026-01 b0xtch squat）は他者保有なので断念。binary 名 `hippo` は crate 名と独立で衝突しない
+- [x] **(6) ライセンス** → **Apache-2.0 / MIT dual で確定**。戦略的意義：`mcp-memory-service-rs` の PolyForm Noncommercial に対する商用フリーポジション（§3 軸4、§9 R8）
+- [x] **(7) Cloudflare 同期** → **v1.x 送り**。v0.3 で SHODH wire compat だけ取り、Cloudflare 同期は doobidoo の `shodh-cloudflare` に schema 互換で乗っかる。1 人開発キャパで自前実装するなら SaaS マネタイズ層として後回し
+- [x] **(8) 全保存モードのデフォルト** → **storage と retrieval を分離**（§4 設計原則）。保存は常にフル + surprise score column、retrieval が surprise-weighted ranking デフォルト ON。物理削除なし（soft-delete のみ）。これで法務派と特異性選別派を両立
 
 ---
 
@@ -282,12 +324,12 @@ abyo-llm-probe + abyo-speculate + claude-hippo の 3 点で「ローカル LLM �
 
 | Day | タスク |
 |-----|--------|
-| 1–2 | リポジトリ初期化、MCP プロトコル選定、基本 store スケルトン |
-| 3–4 | SQLite 統合、ローカル埋め込み（FastEmbed / candle）、Claude Code 統合 |
-| 5–6 | 5 つの基本 MCP tools 実装、E2E 動作確認 |
-| 7–8 | mcp-memory-keeper / MemCP との比較ベンチ（自前計測） |
-| 9–10 | README / docs / 公開準備 |
-| 11–14 | バグ修正、ブログ草稿、crates.io 公開、HN 投稿 |
+| 1–2 | リポジトリ初期化、`rmcp` 1.6 で hello tool 動作、`cargo bloat` で binary サイズ計測 |
+| 3–4 | `rusqlite` + `sqlite-vec` 統合（SHODH 互換 schema）、`fastembed` で BGE-small 埋め込み、Claude Code 統合 |
+| 5–6 | 5 つの基本 MCP tools 実装、`@modelcontextprotocol/inspector` で E2E 動作確認 |
+| 7–8 | 比較ベンチ（vs `mcp-memory-service-rs`, `mcp-memory-service`, `mcp-memory-keeper`, `MemCP`）、`criterion` で再現可能化 |
+| 9–10 | README / docs / 公開準備、RSS <50MB 達成可否判定（未達なら candle 乗り換え検討） |
+| 11–14 | バグ修正、ブログ草稿、crates.io publish、HN 投稿 |
 
 成果物：crates.io 公開、ブログ第 1 弾、HN 投稿
 
@@ -295,19 +337,21 @@ abyo-llm-probe + abyo-speculate + claude-hippo の 3 点で「ローカル LLM �
 
 | Day | タスク |
 |-----|--------|
-| 1–2 | surprise score パイプライン |
-| 3–4 | 重要度判定、forgetting curve |
+| 1 | `docs/SURPRISE_SELECTION.md` スタブ作成（理論・式・評価軸を別ドキュメント化） |
+| 1–2 | surprise score パイプライン（embedding outlier + engagement signal + explicit marker から開始、prediction loss は abyo-llm-probe 統合 = v0.3） |
+| 3–4 | 重要度判定、forgetting curve（decay model）、retrieval ranking |
 | 5–6 | 独自評価ベンチ（Long-session noise / Cross-session retrieval） |
-| 7 | ブログ第 2 弾、HN 再投稿 |
+| 7 | ブログ第 2 弾、HN 再投稿、`docs/SURPRISE_SELECTION.md` 肉付け完了 |
 
-成果物：v0.2、独自ベンチ結果、ブログ第 2 弾
+成果物：v0.2、独自ベンチ結果、ブログ第 2 弾、SURPRISE_SELECTION.md 公開
 
-### Sprint S3 / abyo 統合（5–7 日）
+### Sprint S3 / abyo 統合 + SHODH 互換（5–7 日）
 
 | Day | タスク |
 |-----|--------|
-| 1–2 | abyo-llm-probe 統合（surprise 高度化） |
-| 3–4 | abyo-filters 内蔵 |
+| 1–2 | abyo-llm-probe 統合（prediction loss を surprise score に追加） |
+| 3 | abyo-filters 内蔵（メモリ存在判定の空間効率化） |
+| 4 | SHODH Unified Memory API Spec v1.0.0 準拠（emotional metadata、episodic memory、source credibility column 追加） |
 | 5–6 | 多 MCP client 対応（Cursor / Continue / Aider）、Anthropic Memory Tool 互換レイヤ |
 | 7 | v1.0 公開、総括ブログ |
 
@@ -345,14 +389,17 @@ abyo-llm-probe + abyo-speculate + claude-hippo の 3 点で「ローカル LLM �
 
 ---
 
-## 13. 着手前 TODO
+## 13. 着手前 TODO（2026-05-09 時点、Sprint S1 開始までに完了）
 
-- [ ] crates.io 名前空間予約：`claude-hippo`, `hippo`, `abyo-hippo`, `hippocampus`
-- [ ] GitHub リポジトリ作成：`abyo-software/claude-hippo`
-- [ ] 競合の最新版を実機試用（特に MemCP, mcp-memory-service）
-- [ ] MCP SDK 最新版確認（公式 Rust SDK の状況）
-- [ ] FastEmbed / candle 比較（バイナリサイズ、起動時間、依存）
-- [ ] §10 オープン質問の決着
+- [ ] **今週中（〜2026-05-16）**: crates.io に `claude-hippo` v0.0.1 placeholder を publish（squat 防止）
+- [ ] **今週中（〜2026-05-16）**: crates.io に `abyo-hippo` v0.0.1 placeholder を publish（防御）
+- [ ] **今週中（〜2026-05-16）**: GitHub リポジトリ作成 `abyo-software/claude-hippo`（README に「Sprint S1 着手予定」だけ書く）
+- [ ] Sprint S1 直前: `mcp-memory-service-rs` を実機 clone + `cargo build` + ベンチ再現（68ms / 241MB を自手元で確認）
+- [ ] Sprint S1 直前: `mcp-memory-service` (Python) と MemCP の docker / pip インストールでベンチ環境を整備
+- [ ] Sprint S1 直前: SHODH spec OpenAPI を読み込んで schema 互換性の差分を `docs/SHODH_COMPAT.md` にメモ
+- [x] §10 オープン質問の決着（本ドキュメントで完了）
+- [x] MCP SDK 最新版確認（rmcp 1.6.x で確定）
+- [x] 埋め込み比較（fastembed 5.13.x で確定、candle は runner-up）
 
 ---
 
@@ -360,11 +407,11 @@ abyo-llm-probe + abyo-speculate + claude-hippo の 3 点で「ローカル LLM �
 
 claude-hippo は **abyo software の結節点**であり、**Youichi が毎日使う**プロダクトであり、**Ferro 売却バリュエーション補強**のブランディング装置。
 
-正直に：
+正直に（v0.3 推敲時点で更新）：
 
-- レッドオーシャン（memory MCP は既に複数）
-- Pure Rust + 特異性選別 + abyo 統合 の 3 軸で差別化
-- Anthropic 公式 Memory Tool 本格化で差別化が薄れるリスクは大
+- レッドオーシャン（memory MCP は既に複数 + Rust 直接競合 `mcp-memory-service-rs` も 4 月リリース済）
+- 4 軸差別化：(a) **特異性選別**、(b) **Pure Rust 軽量（<50MB）**、(c) **abyo 統合**、(d) **Apache/MIT 商用フリー**
+- Anthropic 公式 Memory Tool 本格化で (a)(b) が薄れるリスクは大
 - 直接収益はゼロ前提
 
 それでも作る理由：
@@ -372,10 +419,11 @@ claude-hippo は **abyo software の結節点**であり、**Youichi が毎日�
 1. Youichi 自身のペインを解決する（dogfooding）
 2. abyo software 群の認知導線として最強
 3. 「Claude Code に海馬」は HN タイトルが立つ
-4. abyo-recall 哲学を統合機能として復活できる
+4. abyo-recall 哲学を `docs/SURPRISE_SELECTION.md` として独立ドキュメント化、独自評価軸で実証する
 5. probe / speculate / filters が全部活きる唯一のプロダクト
+6. 唯一の Rust 競合が PolyForm Noncommercial で商用閉鎖、Apache/MIT の開放枠が空いている
 
-過剰な期待をせず、地道に作って公開して、ユーザの反応を見ながら育てる。
+過剰な期待をせず、地道に作って公開して、ユーザの反応を見ながら育てる。`mcp-memory-service-rs` を素直に名指しで対比し、棲み分けを誠実に書くことで HN/Lobsters の信頼を獲りに行く。
 
 ---
 
@@ -384,22 +432,42 @@ claude-hippo は **abyo software の結節点**であり、**Youichi が毎日�
 ```
 @PLAN.md を読んで、claude-hippo Sprint S1 (v0.1 MVP) を開始してくれ。
 
+技術選定は §10 で決着済：
+- MCP SDK: rmcp 1.6.x (features: server, macros, transport-io)
+- DB: rusqlite 0.39 (bundled) + sqlite-vec 0.1 (SHODH 互換 schema)
+- 埋め込み: fastembed 5.13.x (BGE-small-en-v1.5 デフォルト)
+- async: tokio 1
+- ライセンス: Apache-2.0 / MIT dual
+- crate 名: claude-hippo (primary) / abyo-hippo (防御)
+- binary 名: hippo
+
 タスク:
 1. リポジトリ初期化（abyo-software/claude-hippo）
-2. MCP SDK 統合（公式 Rust SDK か rust-mcp 系を選定し PLAN.md §10 を更新）
-3. SQLite + ローカル埋め込み（FastEmbed / candle）の記憶ストア
-4. 5 つの基本 MCP tools 実装:
-   - hippo_remember
-   - hippo_recall
-   - hippo_list_recent
-   - hippo_forget
-   - hippo_session_summary
-5. Claude Code から動作確認（手動 E2E）
-6. mcp-memory-keeper, MemCP との起動時間・メモリ使用量比較ベンチ
+2. rmcp 1.6 で hello_world tool が動くことを確認 (npx @modelcontextprotocol/inspector)
+3. rusqlite + sqlite-vec で記憶ストア（mcp-memory-service-rs と同 schema を最初から）
+4. fastembed で埋め込みパイプライン（モデル DL は ~/.cache/claude-hippo/models/ にキャッシュ）
+5. 5 つの基本 MCP tools 実装:
+   - hippo_remember(content, tags, importance?)
+   - hippo_recall(query, limit?)
+   - hippo_list_recent(n?)
+   - hippo_forget(id)  # soft-delete のみ
+   - hippo_session_summary()
+   設計原則: storage は常にフル、retrieval が surprise-weighted (v0.2 で本格化、v0.1 は recency + tag match のみ)
+6. Claude Code から動作確認（手動 E2E）
+7. 比較ベンチ:
+   - vs mcp-memory-service-rs (Rust 直接競合) ← 最重要
+   - vs mcp-memory-service (Python 上流)
+   - vs mcp-memory-keeper (TypeScript)
+   - vs MemCP (Python)
+   指標: cold-start, RSS, store p50/p95, retrieve p50/p95
+8. RSS <50MB 達成可否を判定。未達なら candle 純 Rust に乗り換え検討（PLAN.md §3 軸2 の判断条件）
 
-ライセンス: Apache-2.0 / MIT dual
-authors: abyo software, LLC
-コマンド名: hippo / crate 名: hippo + claude-hippo（両方押さえる）
+注意点 (S1 spike で詰まる箇所):
+- ort dylib のクロスコンパイル (CI matrix を macos-14 / ubuntu-latest で分割)
+- モデル weight の vendoring vs runtime DL (fallback DL を入れる)
+- tokenizers の onig feature (CI に C コンパイラ必須)
+
 最初のコミットメッセージは「初期化」レベル可、後で物語を作る。
 PLAN.md の未着手チェックボックスを進捗に応じて更新すること。
+ベンチ結果は docs/BENCH.md に記録、未達なら正直に書く（CLAUDE.md 「honest limitations 重視」）。
 ```

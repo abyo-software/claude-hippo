@@ -5,7 +5,9 @@
 
 ## [Unreleased]
 
-### Added (v0.3 in progress — Phase A + B complete)
+## [0.3.0] - 2026-05-10
+
+### Added (Phase A + B + C + D)
 
 **Phase A — surprise rerank の honest limitations 解消**:
 - **`decay_floor` ranking parameter**（CLI `--decay-floor`、env `HIPPO_DECAY_FLOOR`、既定 0.5）— Bench B が v0.2 で surface した「365 日越え (12 half-lives) で `surprise·decay → 0` する一方で fresh chat の `surprise·1` が old high-importance Decision を demote する」失敗モードを構造的に解消。`max(decay(age, half_life), decay_floor)` で old item の surprise 寄与に下限を設定。Bench B 365d で **negative lift → +0.875 lift** にflip
@@ -32,13 +34,23 @@
 - `examples/external_embedding_smoke.rs` — OpenAI / Ollama / TEI / custom 4 種類の手動 smoke
 - `examples/bench_external_rss.rs` — wiremock in-process で **peak RSS = 25.7 MB** 実測（target <30 MB **MET**）。store p50 0.57 ms / retrieve p50 0.75 ms（ローカルmock基準）
 
-### Planned (v0.3 残)
-- 多 MCP client 動作確認（Cursor / Continue / Aider）
-- Anthropic Memory Tool 互換レイヤ
-- SHODH OpenAPI REST 互換 endpoint (`--shodh-rest`)
+**Phase D — Multi-client + compat layers**:
+- `docs/CLIENT_COMPAT.md` 新設 — Claude Code / Cursor / Continue / Aider 4 client の MCP 設定スニペット + per-release verification checklist
+- `--anthropic-memory-tool` flag (env `HIPPO_ANTHROPIC_MEMORY_TOOL`) — Anthropic Memory Tool (`memory_20250818`) 互換 surface を `memory` MCP tool として追加。`/memories` filesystem ファサード、6 command (view / create / str_replace / insert / delete / rename) 全実装、path traversal 防御、metadata.`_hippo.memory_tool.path` で round-trip。新規 module `src/memory_tool.rs` + 7 unit tests
+- `--shodh-rest` flag (env `HIPPO_SHODH_REST`) + `--shodh-rest-bind` (default `127.0.0.1:8765`) — axum 0.8 ベースの SHODH OpenAPI v1.0.0 REST server。6 endpoint (health / remember / recall / memories / forget/:id / stats) 実装、残り 7 endpoint は 501 Not Implemented + actionable error。新規 module `src/shodh_rest.rs` + 4 axum unit tests
+- v0.3 design: 1 process = 1 transport (`--shodh-rest` 設定時は stdio MCP 無効、両用は 2 process で SQLite WAL 共有)。in-process dual-serve は v0.4 候補
+
+### Stats
+- 85 tests (71 unit incl. memory_tool + shodh_rest + 4 axum, 9 wiremock embedding, 9 wiremock prediction_loss, 3 integration, 4 eval)
+- clippy clean、fmt clean、cargo audit 0 new advisories
+- 新規依存: axum 0.8 (REST server)、tower 0.5、wiremock 0.6 (dev-only)
+- crates.io: `cargo install claude-hippo` で v0.3.0 公開
+- GitHub: https://github.com/abyo-software/claude-hippo/releases/tag/v0.3.0
 
 ### Planned (v0.4)
 - candle-rs native local prediction-loss backend (no external HTTP service required, GPU 持ち向け)。abyo-llm-probe Stage 2 (Vast.ai 4090) 完走後に判断
+- SHODH 残り 7 endpoint (consolidate / by-tags variants / context auto-ingest / per-id GET/PATCH / list tags)
+- in-process dual-serve (stdio MCP + SHODH REST 同時起動) — rmcp owned-self serve refactor 後
 
 ## [0.2.0] - 2026-05-10
 

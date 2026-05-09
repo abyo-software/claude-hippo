@@ -140,15 +140,19 @@ score = 0.7 * cos_sim
 ## CLI
 
 ```bash
-hippo serve [--db PATH] [--model-cache DIR]   # MCP stdio (default)
+hippo serve [--db PATH] [--model-cache DIR] \
+            [--surprise-weights "0.4,0.2,0.1,0.3"] \
+            [--embedding-model {minilm-l6-v2|bge-small-en-v15-q}]   # MCP stdio (default)
 hippo verify [--db PATH]                       # schema apply + sqlite-vec 確認
-hippo embed "text"                             # 埋め込み単発、smoke test
-hippo bench --n 100                            # 自前 self-bench
+hippo embed "text" [--embedding-model X]       # 埋め込み単発、smoke test
+hippo bench --n 100 [--surprise-weights X] [--embedding-model X]    # 自前 self-bench
 ```
 
 env：
 - `HIPPO_DB_PATH` — SQLite path（default `~/.local/share/claude-hippo/memory.db`）
 - `HIPPO_MODEL_CACHE` — embedding model dir（default `~/.cache/claude-hippo/models/`）
+- `HIPPO_SURPRISE_WEIGHTS` — `"w_outlier,w_engagement,w_explicit,w_prediction"`、合計 1.0 (±1e-3)。default `"0.4,0.2,0.1,0.3"`
+- `HIPPO_EMBEDDING_MODEL` — `minilm-l6-v2` (default、SHODH DB swap 互換) or `bge-small-en-v15-q` (量子化、384 dim 維持)
 - `RUST_LOG` — `tracing-subscriber` フィルタ
 
 ---
@@ -217,14 +221,21 @@ CREATE VIRTUAL TABLE memory_embeddings USING vec0(content_embedding FLOAT[384] d
 
 ## ステータス
 
-**v0.1**: production-ready as a drop-in for `mcp-memory-service-rs` with surprise scoring. 29 unit tests + 3 integration tests + DB swap conformance test all pass.
+**v0.2** (2026-05-10 release): production-ready as a drop-in for `mcp-memory-service-rs` with surprise scoring + **独自評価ベンチ Bench A/B/C 実数値あり**。
+
+| Bench | 効果 | 詳細 |
+|---|---|---|
+| A: Long-session noise | precision@1 を **8% → 72%** (既定) / **100%** (full oversample) | 100 items, 25 paraphrased queries |
+| B: Cross-session retrieval (forgetting curve) | 30 日決定は perfect、365 日で **負の lift** (honestly 公開) | 50 items × 4 ages |
+| C: Decision trace | recall@5 を **0.44 → 0.97** (既定 weights) / **1.00** (`--surprise-weights "0.2,0.1,0.5,0.2"`) | 4 Decisions in 20 mixed |
+
+40 unit + 3 integration + 3 eval = **46 tests** all pass. DB swap conformance も pass。詳細は [docs/SURPRISE_SELECTION.md](docs/SURPRISE_SELECTION.md)。
 
 将来：
-- v0.2: surprise-based selection の独自評価ベンチ（Long-session noise, Cross-session retrieval, Decision trace）+ docs/SURPRISE_SELECTION.md 肉付け
-- v0.3: abyo-llm-probe 統合（`prediction_loss` を埋める）+ abyo-filters 内蔵 + Anthropic Memory Tool 互換レイヤ + 多 MCP client（Cursor / Continue / Aider）対応
+- v0.3: abyo-llm-probe 統合（`prediction_loss` を埋める）+ abyo-filters 内蔵 + External embedding API backend (`docs/EXTERNAL_EMBEDDING.md` 設計済) + decay floor / `--half-life-days` CLI（Bench B 365 日 demotion 対処）+ Anthropic Memory Tool 互換レイヤ + 多 MCP client（Cursor / Continue / Aider）対応
 - v1.x: SaaS マネタイズ層（Cloudflare 同期 etc）
 
-開発計画は [PLAN.md](PLAN.md)。
+開発計画は [PLAN.md](PLAN.md)、変更履歴は [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -250,10 +261,15 @@ python3 scripts/conformance_swap.py
 ## 開発
 
 ```bash
-cargo test --lib                # unit (29)
-cargo test                      # + integration (3) — 要 ONNX cache
+cargo test --lib                # unit (40)
+cargo test --release            # + integration (3) + eval (3) — eval は MockEmbedder で ONNX 不要
+cargo test --release --test eval_a_long_session    # Bench A 単発
+cargo test --release --test eval_b_cross_session   # Bench B 単発
+cargo test --release --test eval_c_decision_trace  # Bench C 単発
+ls target/eval_results/          # bench_*.json が生成される
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+cargo audit                      # cargo install --locked cargo-audit が必要
 ```
 
 ---

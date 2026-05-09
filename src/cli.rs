@@ -1,6 +1,7 @@
 //! CLI — clap derive。serve / verify / embed / bench。
 
-use crate::embeddings::{Embedder, FastEmbedder};
+use crate::embeddings::{Embedder, EmbeddingModelKind, FastEmbedder};
+use crate::surprise::SurpriseWeights;
 use crate::{server, storage, VERSION};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -27,6 +28,15 @@ enum Cmd {
         /// or ~/.cache/claude-hippo/models/.
         #[arg(long, env = "HIPPO_MODEL_CACHE")]
         model_cache: Option<PathBuf>,
+        /// Surprise score weights as `w_outlier,w_engagement,w_explicit,w_prediction`.
+        /// All in 0.0..=1.0, sum must be 1.0 (±1e-3). Default: `0.4,0.2,0.1,0.3`.
+        #[arg(long, env = "HIPPO_SURPRISE_WEIGHTS")]
+        surprise_weights: Option<String>,
+        /// Embedding model. `minilm-l6-v2` (default, mcp-memory-service-rs と
+        /// 同 vector space) or `bge-small-en-v15-q` (量子化、~33 MB)。
+        /// Both are 384 dim.
+        #[arg(long, env = "HIPPO_EMBEDDING_MODEL")]
+        embedding_model: Option<String>,
     },
     /// Open the database, apply schema, verify sqlite-vec, print stats.
     /// Does not read/write any memories. Safe against a live DB.
@@ -40,6 +50,8 @@ enum Cmd {
         text: String,
         #[arg(long, env = "HIPPO_MODEL_CACHE")]
         model_cache: Option<PathBuf>,
+        #[arg(long, env = "HIPPO_EMBEDDING_MODEL")]
+        embedding_model: Option<String>,
     },
     /// Run a quick self-bench: cold start + N store + N retrieve + RSS.
     Bench {
@@ -49,6 +61,10 @@ enum Cmd {
         db: Option<PathBuf>,
         #[arg(long, env = "HIPPO_MODEL_CACHE")]
         model_cache: Option<PathBuf>,
+        #[arg(long, env = "HIPPO_SURPRISE_WEIGHTS")]
+        surprise_weights: Option<String>,
+        #[arg(long, env = "HIPPO_EMBEDDING_MODEL")]
+        embedding_model: Option<String>,
     },
 }
 
@@ -66,9 +82,26 @@ fn ensure_parent_dir(p: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn build_embedder(model_cache: Option<PathBuf>) -> anyhow::Result<Arc<dyn Embedder>> {
+fn parse_model_kind(opt: Option<&str>) -> anyhow::Result<EmbeddingModelKind> {
+    match opt {
+        None => Ok(EmbeddingModelKind::default()),
+        Some(s) => EmbeddingModelKind::parse(s).map_err(|e| anyhow::anyhow!(e)),
+    }
+}
+
+fn parse_weights(opt: Option<&str>) -> anyhow::Result<SurpriseWeights> {
+    match opt {
+        None => Ok(SurpriseWeights::default()),
+        Some(s) => SurpriseWeights::parse_csv(s).map_err(|e| anyhow::anyhow!(e)),
+    }
+}
+
+fn build_embedder(
+    model_cache: Option<PathBuf>,
+    model: EmbeddingModelKind,
+) -> anyhow::Result<Arc<dyn Embedder>> {
     let cache = model_cache.unwrap_or_else(crate::embeddings::default_cache_dir);
-    let e = FastEmbedder::new(cache)?;
+    let e = FastEmbedder::new_with_model(cache, model)?;
     Ok(Arc::new(e))
 }
 
@@ -85,18 +118,32 @@ pub async fn run() -> anyhow::Result<()> {
     let cmd = cli.command.unwrap_or(Cmd::Serve {
         db: None,
         model_cache: None,
+        surprise_weights: None,
+        embedding_model: None,
     });
 
     storage::register_sqlite_vec();
 
     match cmd {
-        Cmd::Serve { db, model_cache } => {
+        Cmd::Serve {
+            db,
+            model_cache,
+            surprise_weights,
+            embedding_model,
+        } => {
             let path = db.unwrap_or_else(default_db_path);
             ensure_parent_dir(&path)?;
+            let weights = parse_weights(surprise_weights.as_deref())?;
+            let model = parse_model_kind(embedding_model.as_deref())?;
             let store = storage::Storage::open(&path)?;
-            let embedder = build_embedder(model_cache)?;
-            tracing::info!(?path, "claude-hippo serve starting (rmcp stdio)");
-            server::run_stdio(store, embedder).await
+            let embedder = build_embedder(model_cache, model)?;
+            tracing::info!(
+                ?path,
+                model = model.as_str(),
+                ?weights,
+                "claude-hippo serve starting (rmcp stdio)"
+            );
+            server::run_stdio_with_weights(store, embedder, weights).await
         }
         Cmd::Verify { db } => {
             let path = db.unwrap_or_else(default_db_path);
@@ -112,21 +159,37 @@ pub async fn run() -> anyhow::Result<()> {
             println!("  total       : {total} (incl. soft-deleted)");
             Ok(())
         }
-        Cmd::Embed { text, model_cache } => {
-            let embedder = build_embedder(model_cache)?;
+        Cmd::Embed {
+            text,
+            model_cache,
+            embedding_model,
+        } => {
+            let model = parse_model_kind(embedding_model.as_deref())?;
+            let embedder = build_embedder(model_cache, model)?;
             let t0 = std::time::Instant::now();
             let v = embedder.embed_one(&text)?;
             let dt = t0.elapsed();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             println!("hippo embed ✓");
             println!("  text     : {text:?}");
+            println!("  model    : {}", model.as_str());
             println!("  total    : {dt:?}");
             println!("  dim      : {}", v.len());
             println!("  L2 norm  : {norm:.6}");
             println!("  first 5  : {:?}", &v[..5.min(v.len())]);
             Ok(())
         }
-        Cmd::Bench { n, db, model_cache } => run_self_bench(n, db, model_cache).await,
+        Cmd::Bench {
+            n,
+            db,
+            model_cache,
+            surprise_weights,
+            embedding_model,
+        } => {
+            let weights = parse_weights(surprise_weights.as_deref())?;
+            let model = parse_model_kind(embedding_model.as_deref())?;
+            run_self_bench(n, db, model_cache, weights, model).await
+        }
     }
 }
 
@@ -134,6 +197,8 @@ async fn run_self_bench(
     n: usize,
     db: Option<PathBuf>,
     model_cache: Option<PathBuf>,
+    weights: SurpriseWeights,
+    model: EmbeddingModelKind,
 ) -> anyhow::Result<()> {
     use std::time::Instant;
     let db_path = db.unwrap_or_else(|| {
@@ -147,12 +212,12 @@ async fn run_self_bench(
 
     let cold0 = Instant::now();
     let store = storage::Storage::open(&db_path)?;
-    let embedder = build_embedder(model_cache)?;
+    let embedder = build_embedder(model_cache, model)?;
     // first embed = model load
     let _ = embedder.embed_one("warmup")?;
     let cold = cold0.elapsed();
 
-    let server = server::MemoryServer::new(store, embedder);
+    let server = server::MemoryServer::new_with_weights(store, embedder, weights);
 
     // store N
     let t1 = Instant::now();
@@ -205,6 +270,14 @@ async fn run_self_bench(
     let rss_kb = read_self_rss_kb().unwrap_or(0);
 
     println!("claude-hippo self-bench ✓");
+    println!("  model    : {}", model.as_str());
+    println!(
+        "  weights  : outlier={:.2} engagement={:.2} explicit={:.2} prediction={:.2}",
+        server.weights().w_outlier,
+        server.weights().w_engagement,
+        server.weights().w_explicit,
+        server.weights().w_prediction,
+    );
     println!("  cold-start (db open + embed warmup) : {cold:?}");
     println!(
         "  store    x{n}: total={store_total:?}  p50={:.1}ms p95={:.1}ms",

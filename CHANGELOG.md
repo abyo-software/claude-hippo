@@ -5,18 +5,41 @@
 
 ## [Unreleased]
 
-### Planned (v0.2)
-- 独自評価ベンチ（Long-session noise / Cross-session retrieval / Decision trace）
-- `SurpriseWeights` の CLI / config 露出
-- ONNX 量子化モデル（BGESmallENV15Q）切替フラグ
-- External embedding API mode (`--embedding-backend external`、RSS <50 MB 経路)
-
 ### Planned (v0.3)
 - `abyo-llm-probe` 統合で `prediction_loss` を埋める
 - `abyo-filters` 内蔵で memory 存在判定を空間効率化
 - 多 MCP client 動作確認（Cursor / Continue / Aider）
 - Anthropic Memory Tool 互換レイヤ
 - SHODH OpenAPI REST 互換 endpoint (`--shodh-rest`)
+- External embedding API backend (`--embedding-backend external`) — 設計済 (`docs/EXTERNAL_EMBEDDING.md`)、実装は v0.3
+- Forgetting curve floor / `--half-life-days` CLI（Bench B が surfacした 365 日越え demotion 問題への対処）
+- `oversample_factor` を MCP `RecallParams` に expose（現状は eval harness のみ）
+
+## [0.2.0] - 2026-05-10
+
+### Added
+- **独自評価ベンチ Bench A/B/C** (`tests/eval_*.rs`) — surprise rerank の数値証拠：
+  - **Bench A** (Long-session noise, 100 items / 25 queries): precision@1 を **8% → 72%** (既定 oversample) / **100%** (完全 oversample) にリフト
+  - **Bench B** (Cross-session, 50 items / 8 queries × 4 ages): half-life=30d 設計の挙動を実測。30 日まで perfect、90 日で baseline 同等、365 日で **負の lift** という limit を honestly 公開
+  - **Bench C** (Decision trace, 20 items / 8 queries): 4 Decision を 16 non-Decision の中から見つける recall を **0.44 → 0.84** (既定 weights) / **1.00** (explicit-heavy weights `--surprise-weights "0.2,0.1,0.5,0.2"`) に
+  - 全 bench は `target/eval_results/bench_*.json` に書き出し、`docs/SURPRISE_SELECTION.md` から参照
+- `--surprise-weights "w_o,w_e,w_x,w_p"` フラグ（`serve` / `bench`）。`SurpriseWeights::parse_csv` が sum=1 (±1e-3) を検証
+- `HIPPO_SURPRISE_WEIGHTS` env でも同設定可
+- `--embedding-model {minilm-l6-v2,bge-small-en-v15-q}` フラグ（`serve` / `embed` / `bench`）。`EmbeddingModelKind` enum で 384 dim 縛り保持、`HIPPO_EMBEDDING_MODEL` env も可
+- `MemoryServer::new_with_weights(...)`、`MemoryServer::recall(...) -> Vec<RecalledMemory>` (typed)、`MemoryServer::recall_with_options(...)` (oversample_factor 調整可)、`MemoryServer::storage_arc()` (eval harness 用)、`Storage::debug_set_created_at(...)` (eval harness 用 backdating)
+- `RecallOptions { oversample_factor }` 構造体（既定 3、production 互換）。fetch_k = limit × factor
+- `cargo audit` を CI 必須 job として追加 (`audit.toml` で `paste` unmaintained を ignore — 理由付きコメント込み、tokenizers の上流が変わったら再評価)
+- `docs/EXTERNAL_EMBEDDING.md` — External embedding API mode の v0.3 設計書（CLI フラグ、API 形状、retry/timeout、RSS 目標、セキュリティ、テストプラン）
+
+### Changed
+- `MemoryServer::do_remember` / `do_recall` を typed wrapper に refactor（内部 `remember(...) -> RememberResult` / `recall(...) -> Vec<RecalledMemory>` を eval/test から直接呼べる）
+- `FastEmbedder` を `EmbeddingModelKind` 受け取りに拡張（既定は MiniLM、互換性維持）
+
+### Documentation
+- `docs/SURPRISE_SELECTION.md` の §「評価軸」を実数値に書き換え。各ベンチの再現コマンド、honest limitations（365 日 demotion、既定 oversample 取りこぼし）を本文に記載
+
+### Tests
+- 40 unit + 3 integration + 3 eval = **46 tests** (v0.1 の 32 から +14)、全 release green、clippy clean、cargo fmt clean
 
 ## [0.1.0] - 2026-05-10
 

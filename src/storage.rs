@@ -392,6 +392,18 @@ impl Storage {
         Ok(n)
     }
 
+    /// **Tests / eval harness only.** Backdate a memory's `created_at` and
+    /// `updated_at` to simulate cross-session recall scenarios. Production
+    /// memories should never be backdated; this helper exists so the v0.2
+    /// evaluation suite can stress the forgetting-curve interaction with
+    /// surprise rerank without waiting 30 days of wall-clock.
+    pub fn debug_set_created_at(&self, id: i64, ts: f64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+            params![ts, id],
+        )?)
+    }
+
     /// soft-delete by id。
     pub fn soft_delete_by_id(&mut self, id: i64) -> Result<usize> {
         let now = unix_now();

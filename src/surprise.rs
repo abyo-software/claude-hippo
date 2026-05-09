@@ -32,6 +32,46 @@ impl Default for SurpriseWeights {
     }
 }
 
+impl SurpriseWeights {
+    /// `"w_o,w_e,w_x,w_p"` 形式の文字列を SurpriseWeights に。
+    /// すべて 0.0..=1.0、合計が 1.0 ± 1e-3 の範囲外なら Err。
+    pub fn parse_csv(s: &str) -> std::result::Result<Self, String> {
+        let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
+        if parts.len() != 4 {
+            return Err(format!(
+                "expected 4 comma-separated weights (w_outlier,w_engagement,w_explicit,w_prediction), got {}",
+                parts.len()
+            ));
+        }
+        let mut vals = [0.0_f32; 4];
+        for (i, p) in parts.iter().enumerate() {
+            let v: f32 = p
+                .parse()
+                .map_err(|e| format!("weight #{} is not a number ({:?}): {e}", i + 1, p))?;
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!(
+                    "weight #{} = {v} is out of range; must be in 0.0..=1.0",
+                    i + 1
+                ));
+            }
+            vals[i] = v;
+        }
+        let sum = vals.iter().sum::<f32>();
+        if (sum - 1.0).abs() > 1e-3 {
+            return Err(format!(
+                "weights must sum to 1.0 (±1e-3), got {sum:.6} (= {} + {} + {} + {})",
+                vals[0], vals[1], vals[2], vals[3]
+            ));
+        }
+        Ok(Self {
+            w_outlier: vals[0],
+            w_engagement: vals[1],
+            w_explicit: vals[2],
+            w_prediction: vals[3],
+        })
+    }
+}
+
 /// 合成 surprise スコア。0.0..=1.0。prediction_loss が None の時は
 /// w_prediction 分を w_outlier と engagement に按分する。
 pub fn score(c: &SurpriseComponents, w: &SurpriseWeights) -> f32 {
@@ -173,6 +213,49 @@ mod tests {
     #[test]
     fn decay_zero_age_is_one() {
         assert_eq!(decay(0.0, 7.0), 1.0);
+    }
+
+    #[test]
+    fn parse_csv_default_roundtrip() {
+        let w = SurpriseWeights::parse_csv("0.4,0.2,0.1,0.3").unwrap();
+        let d = SurpriseWeights::default();
+        assert!((w.w_outlier - d.w_outlier).abs() < 1e-6);
+        assert!((w.w_engagement - d.w_engagement).abs() < 1e-6);
+        assert!((w.w_explicit - d.w_explicit).abs() < 1e-6);
+        assert!((w.w_prediction - d.w_prediction).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_csv_rejects_wrong_arity() {
+        assert!(SurpriseWeights::parse_csv("0.5,0.5").is_err());
+        assert!(SurpriseWeights::parse_csv("0.25,0.25,0.25,0.25,0.0").is_err());
+    }
+
+    #[test]
+    fn parse_csv_rejects_out_of_range() {
+        let r = SurpriseWeights::parse_csv("1.5,-0.5,0.0,0.0");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn parse_csv_rejects_bad_sum() {
+        let r = SurpriseWeights::parse_csv("0.5,0.5,0.5,0.5");
+        assert!(r.is_err(), "sum=2.0 should be rejected");
+        let r = SurpriseWeights::parse_csv("0.1,0.1,0.1,0.1");
+        assert!(r.is_err(), "sum=0.4 should be rejected");
+    }
+
+    #[test]
+    fn parse_csv_accepts_within_tolerance() {
+        // sum = 1.0009 → within 1e-3
+        let w = SurpriseWeights::parse_csv("0.2503,0.2503,0.2503,0.25").unwrap();
+        let s = w.w_outlier + w.w_engagement + w.w_explicit + w.w_prediction;
+        assert!((s - 1.0).abs() < 2e-3);
+    }
+
+    #[test]
+    fn parse_csv_rejects_non_numeric() {
+        assert!(SurpriseWeights::parse_csv("0.4,0.2,abc,0.4").is_err());
     }
 
     #[test]

@@ -1,0 +1,17 @@
+## cargo-audit configuration. Run via `cargo audit`.
+##
+## We treat warnings as errors (`-D warnings` in CI) so unmaintained or
+## yanked crates fail the build — except for the entries listed below,
+## each of which carries a written reason that must be re-evaluated when
+## upstream cuts a new release.
+
+[advisories]
+# Transitive only (fastembed -> tokenizers -> paste, image -> rav1e -> paste,
+# tokenizers -> macro_rules_attribute -> paste). The `paste` crate is feature-
+# complete and the maintainer marked it as unmaintained without a real CVE.
+# We cannot drop it without dropping fastembed; revisit when tokenizers ships
+# a paste-free release.
+ignore = ["RUSTSEC-2024-0436"]
+
+[output]
+deny = ["warnings"]

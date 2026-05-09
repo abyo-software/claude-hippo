@@ -25,6 +25,28 @@ use tokio::sync::Mutex;
 const DEFAULT_HALF_LIFE_DAYS: f32 = 30.0;
 const DEFAULT_RETRIEVE_K: usize = 10;
 const DEFAULT_LIST_N: i64 = 20;
+const DEFAULT_OVERSAMPLE_FACTOR: usize = 3;
+
+/// Retrieval-time tuning knobs that don't belong on the public MCP tool schema.
+/// Used by the eval harness and any caller that needs to opt out of the
+/// default 3× over-fetch (e.g. "summary" queries that need to see the whole
+/// memory pool before surprise rerank).
+#[derive(Debug, Clone, Copy)]
+pub struct RecallOptions {
+    /// Multiplier applied to `RecallParams.limit` to determine how many
+    /// candidates KNN returns before surprise rerank trims to `limit`.
+    /// Default 3. Set higher when the corpus is large and you want more
+    /// items considered for rerank; set to 1 to disable over-fetch entirely.
+    pub oversample_factor: usize,
+}
+
+impl Default for RecallOptions {
+    fn default() -> Self {
+        Self {
+            oversample_factor: DEFAULT_OVERSAMPLE_FACTOR,
+        }
+    }
+}
 
 pub struct MemoryServer {
     #[allow(dead_code)]
@@ -170,13 +192,32 @@ pub struct SessionSummary {
 #[tool_router]
 impl MemoryServer {
     pub fn new(storage: Storage, embedder: Arc<dyn Embedder>) -> Self {
+        Self::new_with_weights(storage, embedder, SurpriseWeights::default())
+    }
+
+    pub fn new_with_weights(
+        storage: Storage,
+        embedder: Arc<dyn Embedder>,
+        weights: SurpriseWeights,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             storage: Arc::new(Mutex::new(storage)),
             embedder,
-            weights: SurpriseWeights::default(),
+            weights,
             started_at: std::time::Instant::now(),
         }
+    }
+
+    pub fn weights(&self) -> SurpriseWeights {
+        self.weights
+    }
+
+    /// **Tests / advanced use only.** Returns the underlying storage Arc for
+    /// direct DB manipulation (e.g. backdating timestamps in evaluation
+    /// scenarios). Production callers should go through MCP tools.
+    pub fn storage_arc(&self) -> Arc<Mutex<Storage>> {
+        self.storage.clone()
     }
 
     #[tool(
@@ -312,10 +353,13 @@ impl MemoryServer {
 }
 
 impl MemoryServer {
-    pub async fn do_remember(
+    /// Typed remember. Returns the `RememberResult` directly instead of the
+    /// JSON-encoded MCP `CallToolResult`. Used by tests / eval harness; the
+    /// MCP `do_remember` is a thin wrapper.
+    pub async fn remember(
         &self,
         p: RememberParams,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
+    ) -> std::result::Result<RememberResult, ErrorData> {
         if p.content.trim().is_empty() {
             return Err(invalid_input("content is empty"));
         }
@@ -352,7 +396,7 @@ impl MemoryServer {
         let mut store = self.storage.lock().await;
         let (id, dup) = store.insert(&row, Some(&embedding)).map_err(internal_err)?;
 
-        json_result(&RememberResult {
+        Ok(RememberResult {
             success: true,
             id,
             content_hash: row.content_hash,
@@ -362,19 +406,31 @@ impl MemoryServer {
         })
     }
 
-    pub async fn do_recall(
+    /// Typed recall with default `RecallOptions`.
+    pub async fn recall(
         &self,
         p: RecallParams,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
+    ) -> std::result::Result<Vec<RecalledMemory>, ErrorData> {
+        self.recall_with_options(p, RecallOptions::default()).await
+    }
+
+    /// Typed recall with custom oversample factor. Used by the eval harness
+    /// to ensure full corpus coverage before surprise rerank.
+    pub async fn recall_with_options(
+        &self,
+        p: RecallParams,
+        opts: RecallOptions,
+    ) -> std::result::Result<Vec<RecalledMemory>, ErrorData> {
         if p.query.trim().is_empty() {
             return Err(invalid_input("query is empty"));
         }
         let k = p.limit.max(1);
+        let factor = opts.oversample_factor.max(1);
         let query_emb = self.embedder.embed_one(&p.query).map_err(internal_err)?;
 
         let store = self.storage.lock().await;
-        // KNN over-fetch when surprise boost (rerank では hit が落ちないように 3x)
-        let fetch_k = if p.no_surprise_boost { k } else { k * 3 };
+        // KNN over-fetch when surprise boost (rerank では hit が落ちないように)
+        let fetch_k = if p.no_surprise_boost { k } else { k * factor };
         let hits = store.knn(&query_emb, fetch_k).map_err(internal_err)?;
 
         let mut results: Vec<RecalledMemory> = Vec::with_capacity(hits.len());
@@ -412,7 +468,23 @@ impl MemoryServer {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results.truncate(k);
-        json_result(&results)
+        Ok(results)
+    }
+
+    pub async fn do_remember(
+        &self,
+        p: RememberParams,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let r = self.remember(p).await?;
+        json_result(&r)
+    }
+
+    pub async fn do_recall(
+        &self,
+        p: RecallParams,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let r = self.recall(p).await?;
+        json_result(&r)
     }
 
     pub async fn do_list_recent(
@@ -597,7 +669,15 @@ fn history_embeddings(store: &Storage, n: i64) -> crate::Result<Vec<Vec<f32>>> {
 
 /// MCP server を stdio で起動する (run loop を await)。
 pub async fn run_stdio(storage: Storage, embedder: Arc<dyn Embedder>) -> anyhow::Result<()> {
-    let server = MemoryServer::new(storage, embedder);
+    run_stdio_with_weights(storage, embedder, SurpriseWeights::default()).await
+}
+
+pub async fn run_stdio_with_weights(
+    storage: Storage,
+    embedder: Arc<dyn Embedder>,
+    weights: SurpriseWeights,
+) -> anyhow::Result<()> {
+    let server = MemoryServer::new_with_weights(storage, embedder, weights);
     let service = server
         .serve(stdio())
         .await

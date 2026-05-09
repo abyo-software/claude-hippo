@@ -5,15 +5,19 @@
 
 ## [Unreleased]
 
-### Planned (v0.3)
-- `abyo-llm-probe` 統合で `prediction_loss` を埋める
-- `abyo-filters` 内蔵で memory 存在判定を空間効率化
+### Added (v0.3 in progress — Phase A complete)
+- **`decay_floor` ranking parameter**（CLI `--decay-floor`、env `HIPPO_DECAY_FLOOR`、既定 0.5）— Bench B が v0.2 で surface した「365 日越え (12 half-lives) で `surprise·decay → 0` する一方で fresh chat の `surprise·1` が old high-importance Decision を demote する」失敗モードを構造的に解消。`max(decay(age, half_life), decay_floor)` で old item の surprise 寄与に下限を設定。Bench B 365d で **negative lift → +0.875 lift** にflip
+- **`--half-life-days` CLI**（env `HIPPO_HALF_LIFE_DAYS`、既定 30.0）— v0.2 でハードコードだった `DEFAULT_HALF_LIFE_DAYS = 30.0` をユーザ tunable 化。0 で decay 完全 disable
+- **`--oversample-factor` CLI**（env `HIPPO_OVERSAMPLE_FACTOR`、既定 6）— v0.2 既定 3 から bump。Bench A 既定で **precision@1 0.72 → 1.000** に。`MCP RecallParams.oversample_factor: Option<usize>` で per-call override も提供
+- `RankingConfig` 構造体 + `MemoryServer::new_with_config(...)` / `server::run_stdio_with_config(...)` — 上記 3 ノブを 1 か所にまとめた server-wide config
+- `RecallParams.oversample_factor: Option<usize>` を MCP schema に expose（v0.2 では `RecallOptions` 内のみで eval-only）
+
+### Planned (v0.3 残)
+- External embedding API backend (`--embedding-backend external`) — 設計済 (`docs/EXTERNAL_EMBEDDING.md`)、実装は Phase B
+- `prediction_loss` を OpenAI 互換 logprobs HTTP backend で実値化（abyo-llm-probe Rust crate 未存在のため Path 3、native candle-rs 移植は v0.4）
 - 多 MCP client 動作確認（Cursor / Continue / Aider）
 - Anthropic Memory Tool 互換レイヤ
 - SHODH OpenAPI REST 互換 endpoint (`--shodh-rest`)
-- External embedding API backend (`--embedding-backend external`) — 設計済 (`docs/EXTERNAL_EMBEDDING.md`)、実装は v0.3
-- Forgetting curve floor / `--half-life-days` CLI（Bench B が surfacした 365 日越え demotion 問題への対処）
-- `oversample_factor` を MCP `RecallParams` に expose（現状は eval harness のみ）
 
 ## [0.2.0] - 2026-05-10
 

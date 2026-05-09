@@ -262,6 +262,7 @@ async fn run_one(cfg: &EvalConfig, no_surprise_boost: bool) -> anyhow::Result<Me
                     query: q.query.clone(),
                     limit: cfg.k,
                     no_surprise_boost,
+                    oversample_factor: None,
                 },
                 opts,
             )

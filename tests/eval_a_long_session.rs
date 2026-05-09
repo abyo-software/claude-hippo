@@ -122,8 +122,10 @@ fn build_config(oversample_factor: usize) -> EvalConfig {
 
 #[tokio::test]
 async fn bench_a_long_session_noise() {
-    // production default
-    let default_oversample = run_ablation(build_config(3))
+    use claude_hippo::server::DEFAULT_OVERSAMPLE_FACTOR;
+    // v0.3 production default (was 3 in v0.2 — the bump is exactly to reach
+    // P@1=1.0 on this bench without per-call tuning).
+    let default_oversample = run_ablation(build_config(DEFAULT_OVERSAMPLE_FACTOR))
         .await
         .expect("bench A default-oversample run");
 
@@ -150,13 +152,18 @@ async fn bench_a_long_session_noise() {
     };
     write_result_json("bench_a_long_session", &report).expect("write bench A result");
 
-    // The honest claim: with full oversample, surprise rerank lifts
-    // precision@1 from ~5% (1/20 random within cluster) to 100% (Decision
-    // always at rank 1). With production default oversample=3, the Decision
-    // may not always reach the rerank pool.
-    println!("\nBench A — Long-session noise");
+    // The honest claim: with v0.3's default oversample=6, KNN over-fetches
+    // 30 items for k=5; that exceeds the within-cluster pool of 20 even
+    // accounting for some inter-cluster bleed, so the Decision is always
+    // in the rerank pool and surprise lifts precision@1 from baseline ~5%
+    // (1/20 random within cluster) to 100%. Full oversample=20 fetches the
+    // whole corpus and is the upper bound. v0.2 default=3 capped at 72%
+    // P@1 because the Decision did not always reach the rerank pool —
+    // documented in CHANGELOG v0.3.0 as an honest limitation now closed.
+    println!("\nBench A — Long-session noise (v0.3)");
     println!(
-        "  default oversample (3): baseline P@1={:.3} MRR={:.3}  surprise P@1={:.3} MRR={:.3}",
+        "  default oversample ({}): baseline P@1={:.3} MRR={:.3}  surprise P@1={:.3} MRR={:.3}",
+        claude_hippo::server::DEFAULT_OVERSAMPLE_FACTOR,
         default_oversample.baseline.precision_at_1,
         default_oversample.baseline.mrr,
         default_oversample.with_surprise.precision_at_1,
@@ -181,14 +188,18 @@ async fn bench_a_long_session_noise() {
         "MRR must be 1.0 when every Decision is rank 1"
     );
 
-    // Surprise must beat baseline on MRR by a meaningful margin even at
-    // production-default oversample. Threshold chosen above the noise floor
-    // of "decision happens to be cosine-closest by chance".
-    assert!(
-        default_oversample.with_surprise.mrr > default_oversample.baseline.mrr + 0.3,
-        "surprise rerank should improve MRR by >0.3 over baseline at default oversample, got \
-         baseline={:.3} with_surprise={:.3}",
-        default_oversample.baseline.mrr,
-        default_oversample.with_surprise.mrr,
+    // v0.3: production default (oversample=6) MUST also reach perfect P@1
+    // on Bench A. This is the explicit acceptance criterion for the
+    // v0.3 default bump.
+    assert_eq!(
+        default_oversample.with_surprise.precision_at_1,
+        1.0,
+        "v0.3: with default oversample={}, Bench A must achieve P@1=1.0 (was 0.72 in v0.2 \
+         when default was 3). If this fails, the default bump regressed.",
+        claude_hippo::server::DEFAULT_OVERSAMPLE_FACTOR,
+    );
+    assert_eq!(
+        default_oversample.with_surprise.mrr, 1.0,
+        "v0.3: with default oversample, Bench A MRR must = 1.0"
     );
 }

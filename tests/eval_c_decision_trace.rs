@@ -150,9 +150,12 @@ fn build_config(weights: SurpriseWeights, oversample_factor: usize) -> EvalConfi
 }
 
 async fn run_for_weights(weights: SurpriseWeights) -> WeightsRun {
-    let default_oversample = run_ablation(build_config(weights, 3))
-        .await
-        .expect("bench C default-oversample run");
+    let default_oversample = run_ablation(build_config(
+        weights,
+        claude_hippo::server::DEFAULT_OVERSAMPLE_FACTOR,
+    ))
+    .await
+    .expect("bench C default-oversample run");
     let full_oversample = run_ablation(build_config(weights, TOTAL_ITEMS))
         .await
         .expect("bench C full-oversample run");

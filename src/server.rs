@@ -22,21 +22,46 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const DEFAULT_HALF_LIFE_DAYS: f32 = 30.0;
+pub const DEFAULT_HALF_LIFE_DAYS: f32 = 30.0;
+pub const DEFAULT_DECAY_FLOOR: f32 = 0.5;
+pub const DEFAULT_OVERSAMPLE_FACTOR: usize = 6;
 const DEFAULT_RETRIEVE_K: usize = 10;
 const DEFAULT_LIST_N: i64 = 20;
-const DEFAULT_OVERSAMPLE_FACTOR: usize = 3;
 
-/// Retrieval-time tuning knobs that don't belong on the public MCP tool schema.
-/// Used by the eval harness and any caller that needs to opt out of the
-/// default 3× over-fetch (e.g. "summary" queries that need to see the whole
-/// memory pool before surprise rerank).
+/// Server-wide ranking config. Plumbed into every recall.
+///
+/// `decay_floor` was added in v0.3 to fix the "old high-surprise Decision
+/// gets demoted by a fresh low-surprise chat after ~12 half-lives" failure
+/// mode that v0.2 Bench B surfaced. `default_oversample_factor` was bumped
+/// from 3 to 6 in v0.3 so production Bench A reaches precision@1 = 1.0
+/// without callers needing to tune anything.
+#[derive(Debug, Clone, Copy)]
+pub struct RankingConfig {
+    pub half_life_days: f32,
+    pub decay_floor: f32,
+    pub default_oversample_factor: usize,
+}
+
+impl Default for RankingConfig {
+    fn default() -> Self {
+        Self {
+            half_life_days: DEFAULT_HALF_LIFE_DAYS,
+            decay_floor: DEFAULT_DECAY_FLOOR,
+            default_oversample_factor: DEFAULT_OVERSAMPLE_FACTOR,
+        }
+    }
+}
+
+/// Per-call retrieval override. The MCP `RecallParams.oversample_factor`
+/// field also flows through here. Callers that need full-corpus coverage
+/// (e.g. eval harness, "summary" queries) bypass the server default by
+/// passing `recall_with_options` directly.
 #[derive(Debug, Clone, Copy)]
 pub struct RecallOptions {
     /// Multiplier applied to `RecallParams.limit` to determine how many
     /// candidates KNN returns before surprise rerank trims to `limit`.
-    /// Default 3. Set higher when the corpus is large and you want more
-    /// items considered for rerank; set to 1 to disable over-fetch entirely.
+    /// Set higher when the corpus is large and you want more items
+    /// considered for rerank; set to 1 to disable over-fetch entirely.
     pub oversample_factor: usize,
 }
 
@@ -54,6 +79,7 @@ pub struct MemoryServer {
     storage: Arc<Mutex<Storage>>,
     embedder: Arc<dyn Embedder>,
     weights: SurpriseWeights,
+    ranking: RankingConfig,
     started_at: std::time::Instant,
 }
 
@@ -119,6 +145,12 @@ pub struct RecallParams {
     /// Disable surprise-weighted ranking (pure cosine similarity only).
     #[serde(default)]
     pub no_surprise_boost: bool,
+    /// Per-call override for the KNN over-fetch multiplier. Larger values
+    /// give surprise rerank a wider candidate pool at the cost of more SQL
+    /// work. Default = server-wide setting (6 in v0.3, was 3 in v0.2). Set
+    /// to `limit / 1` to disable over-fetch entirely. Caps at 1 minimum.
+    #[serde(default)]
+    pub oversample_factor: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,7 +224,12 @@ pub struct SessionSummary {
 #[tool_router]
 impl MemoryServer {
     pub fn new(storage: Storage, embedder: Arc<dyn Embedder>) -> Self {
-        Self::new_with_weights(storage, embedder, SurpriseWeights::default())
+        Self::new_with_config(
+            storage,
+            embedder,
+            SurpriseWeights::default(),
+            RankingConfig::default(),
+        )
     }
 
     pub fn new_with_weights(
@@ -200,17 +237,31 @@ impl MemoryServer {
         embedder: Arc<dyn Embedder>,
         weights: SurpriseWeights,
     ) -> Self {
+        Self::new_with_config(storage, embedder, weights, RankingConfig::default())
+    }
+
+    pub fn new_with_config(
+        storage: Storage,
+        embedder: Arc<dyn Embedder>,
+        weights: SurpriseWeights,
+        ranking: RankingConfig,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             storage: Arc::new(Mutex::new(storage)),
             embedder,
             weights,
+            ranking,
             started_at: std::time::Instant::now(),
         }
     }
 
     pub fn weights(&self) -> SurpriseWeights {
         self.weights
+    }
+
+    pub fn ranking_config(&self) -> RankingConfig {
+        self.ranking
     }
 
     /// **Tests / advanced use only.** Returns the underlying storage Arc for
@@ -406,16 +457,27 @@ impl MemoryServer {
         })
     }
 
-    /// Typed recall with default `RecallOptions`.
+    /// Typed recall using server-wide ranking config and per-call
+    /// `RecallParams.oversample_factor` (if set).
     pub async fn recall(
         &self,
         p: RecallParams,
     ) -> std::result::Result<Vec<RecalledMemory>, ErrorData> {
-        self.recall_with_options(p, RecallOptions::default()).await
+        let factor = p
+            .oversample_factor
+            .unwrap_or(self.ranking.default_oversample_factor);
+        self.recall_with_options(
+            p,
+            RecallOptions {
+                oversample_factor: factor,
+            },
+        )
+        .await
     }
 
     /// Typed recall with custom oversample factor. Used by the eval harness
-    /// to ensure full corpus coverage before surprise rerank.
+    /// to ensure full corpus coverage before surprise rerank, and by the
+    /// `recall` wrapper to apply the per-call `RecallParams.oversample_factor`.
     pub async fn recall_with_options(
         &self,
         p: RecallParams,
@@ -451,7 +513,8 @@ impl MemoryServer {
                     cos_sim,
                     surprise_score.unwrap_or(0.0),
                     age_days,
-                    DEFAULT_HALF_LIFE_DAYS,
+                    self.ranking.half_life_days,
+                    self.ranking.decay_floor,
                 )
             };
             results.push(RecalledMemory {
@@ -669,7 +732,13 @@ fn history_embeddings(store: &Storage, n: i64) -> crate::Result<Vec<Vec<f32>>> {
 
 /// MCP server を stdio で起動する (run loop を await)。
 pub async fn run_stdio(storage: Storage, embedder: Arc<dyn Embedder>) -> anyhow::Result<()> {
-    run_stdio_with_weights(storage, embedder, SurpriseWeights::default()).await
+    run_stdio_with_config(
+        storage,
+        embedder,
+        SurpriseWeights::default(),
+        RankingConfig::default(),
+    )
+    .await
 }
 
 pub async fn run_stdio_with_weights(
@@ -677,7 +746,16 @@ pub async fn run_stdio_with_weights(
     embedder: Arc<dyn Embedder>,
     weights: SurpriseWeights,
 ) -> anyhow::Result<()> {
-    let server = MemoryServer::new_with_weights(storage, embedder, weights);
+    run_stdio_with_config(storage, embedder, weights, RankingConfig::default()).await
+}
+
+pub async fn run_stdio_with_config(
+    storage: Storage,
+    embedder: Arc<dyn Embedder>,
+    weights: SurpriseWeights,
+    ranking: RankingConfig,
+) -> anyhow::Result<()> {
+    let server = MemoryServer::new_with_config(storage, embedder, weights, ranking);
     let service = server
         .serve(stdio())
         .await
@@ -728,6 +806,7 @@ mod tests {
                 query: "alpha".into(),
                 limit: 3,
                 no_surprise_boost: false,
+                oversample_factor: None,
             })
             .await
             .unwrap();

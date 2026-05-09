@@ -1,24 +1,22 @@
-//! Bench B — Cross-session retrieval (v0.2 evaluation axis).
+//! Bench B — Cross-session retrieval (v0.2 axis, recalibrated for v0.3).
 //!
 //! Setup: 1 high-importance Decision from N days ago, surrounded by 49
 //! fresh low-importance chats in the same topic cluster. We sweep N over
-//! {0, 30, 90, 365} (today, one half-life, three half-lives, ten half-lives)
-//! and measure how often the old Decision still surfaces under paraphrased
-//! queries.
+//! {0, 30, 90, 365} (today, one half-life, three half-lives, twelve
+//! half-lives) and measure how often the old Decision still surfaces under
+//! paraphrased queries.
 //!
-//! Hypothesis:
-//! - At N=0, surprise rerank gives a strong lift (same as Bench A).
-//! - At N=30 (half-life), the Decision's `surprise·decay` is exactly half
-//!   its t=0 value, but still beats the fresh chats' raw surprise; rerank
-//!   should still surface it.
-//! - At N=90 (~3 half-lives, decay ≈ 0.125), the Decision starts to lose
-//!   ground to fresh content. **This is intended** — old + low-importance
-//!   should fade.
-//! - At N=365 (~12 half-lives, decay ≈ 2e-4), the Decision is effectively
-//!   forgotten, and surprise no longer helps.
-//!
-//! These numbers calibrate the half-life parameter (`DEFAULT_HALF_LIFE_DAYS
-//! = 30.0`) and document where the forgetting curve starts to dominate.
+//! v0.3 hypothesis (post `decay_floor` fix):
+//! - At every age, the Decision's `surprise · max(decay, decay_floor)` keeps
+//!   it above fresh chats' `surprise · 1.0` because the Decision's raw
+//!   surprise (importance=1.0 + long+tagged content) dominates the chats'
+//!   engagement-only surprise even when Decision's decay term is reduced
+//!   to `decay_floor=0.5`. v0.2's failure mode (365d negative lift) is
+//!   eliminated.
+//! - With full oversample, P@1 should hold at 1.0 across all ages.
+//! - Default 6× oversample widens the pool so Bench B's harder one-cluster
+//!   workload still benefits, but full coverage is still required for
+//!   guaranteed retrieval when all items live in one tight cluster.
 
 #[path = "eval/mod.rs"]
 mod eval;
@@ -124,9 +122,10 @@ fn build_config(age_days: f32, oversample_factor: usize) -> EvalConfig {
 
 #[tokio::test]
 async fn bench_b_cross_session_retrieval() {
+    use claude_hippo::server::DEFAULT_OVERSAMPLE_FACTOR;
     let mut runs = Vec::with_capacity(AGES_DAYS.len());
     for &age in AGES_DAYS {
-        let default_oversample = run_ablation(build_config(age, 3))
+        let default_oversample = run_ablation(build_config(age, DEFAULT_OVERSAMPLE_FACTOR))
             .await
             .expect("bench B default-oversample run");
         let full_oversample = run_ablation(build_config(age, TOTAL_ITEMS))
@@ -160,13 +159,16 @@ async fn bench_b_cross_session_retrieval() {
             half_life_days_in_server: 30.0,
             note: "1 old Decision (importance=1.0) + 49 fresh chats. Decision is backdated by \
                    the indicated age_days. Baseline = pure cosine (no decay applies). \
-                   surprise+decay = production default with half_life=30d.",
+                   surprise+decay = v0.3 production default: half_life=30d, decay_floor=0.5, \
+                   default_oversample=6. The decay_floor preserves a baseline surprise \
+                   contribution so high-importance items are not demoted by fresh \
+                   low-surprise items past ~12 half-lives (the v0.2 failure mode).",
         },
         runs,
     };
     write_result_json("bench_b_cross_session", &report).expect("write bench B result");
 
-    // Headline assertions — these are the "spec" of v0.2's decay calibration.
+    // Headline assertions — these are the "spec" of v0.3's decay calibration.
 
     let r0 = report
         .runs
@@ -195,15 +197,15 @@ async fn bench_b_cross_session_retrieval() {
         .iter()
         .find(|r| r.decision_age_days == 90.0)
         .unwrap();
-    // At 90 days the decision SHOULD start to lose. We don't assert it loses
-    // for sure (depends on noise), but we record the regression and assert
-    // that the gain over baseline has shrunk substantially.
     let r90_lift = r90.full_oversample.with_surprise.mrr - r90.full_oversample.baseline.mrr;
     let r0_lift = r0.full_oversample.with_surprise.mrr - r0.full_oversample.baseline.mrr;
+    // v0.3: decay_floor keeps the lift from collapsing — r90_lift should be
+    // close to r0_lift (≤ +1e-6 rounding). This is the inverse of v0.2's
+    // "monotonic shrinkage" expectation.
     assert!(
-        r90_lift <= r0_lift,
-        "decay must monotonically shrink the surprise lift; got r0_lift={r0_lift:.3} \
-         r90_lift={r90_lift:.3}"
+        (r0_lift - r90_lift).abs() < 1e-3 || r90_lift <= r0_lift,
+        "with decay_floor in effect, r90_lift must not exceed r0_lift by more than rounding; \
+         got r0_lift={r0_lift:.3} r90_lift={r90_lift:.3}"
     );
 
     let r365 = report
@@ -211,18 +213,21 @@ async fn bench_b_cross_session_retrieval() {
         .iter()
         .find(|r| r.decision_age_days == 365.0)
         .unwrap();
-    // At 365 days (~12 half-lives, decay ≈ 2e-4) the old Decision's
-    // `surprise·decay` is essentially zero. Crucially, fresh chats' raw
-    // surprise (engagement-driven, ~0.03) DOES still contribute to their
-    // rerank score, so they get a small boost the old Decision no longer
-    // gets. This means rerank can actively *demote* very old high-surprise
-    // items below fresh low-surprise items. We don't paper over that — the
-    // bench records it and the docs flag it as a known v0.2 limitation.
+    // v0.3 fix: at 365 days (~12 half-lives) the raw `decay()` term is ~2e-4,
+    // but `decay_floor=0.5` clamps it to 0.5, so the Decision still gets
+    // 0.3 * surprise * 0.5 of contribution. Combined with importance=1.0
+    // dominating the chats' engagement-only surprise, the Decision wins.
+    // This is the explicit reversal of v0.2's "negative lift" honest
+    // limitation (CHANGELOG v0.3.0).
     let r365_lift = r365.full_oversample.with_surprise.mrr - r365.full_oversample.baseline.mrr;
     assert!(
-        r365_lift <= 0.05,
-        "after 365 days the surprise rerank must NOT add positive lift over baseline; \
-         got lift={r365_lift:.3}. Negative or zero lift is expected and documented \
-         as a v0.2 forgetting-curve artifact."
+        r365_lift > 0.5,
+        "v0.3: after 365 days the surprise rerank MUST add positive lift (>0.5) over \
+         baseline thanks to decay_floor; got lift={r365_lift:.3}. If this fails, \
+         decay_floor regression — see CHANGELOG v0.3.0."
+    );
+    assert_eq!(
+        r365.full_oversample.with_surprise.precision_at_1, 1.0,
+        "v0.3: 365-day-old decision must still rank #1 with full oversample"
     );
 }

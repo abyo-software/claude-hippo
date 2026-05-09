@@ -141,9 +141,21 @@ pub fn decay(age_days: f32, half_life_days: f32) -> f32 {
 }
 
 /// retrieval ranking 用合成スコア。
-/// `relevance = w_sim * cos_sim + w_surprise * surprise * decay(age)`
-pub fn ranking(cos_sim: f32, surprise: f32, age_days: f32, half_life_days: f32) -> f32 {
-    let decayed = surprise * decay(age_days, half_life_days);
+/// `relevance = 0.7 * cos_sim + 0.3 * surprise * max(decay(age), decay_floor)`
+///
+/// `decay_floor` ∈ [0,1] は forgetting curve の下限。0.0 だと v0.2 と同じ
+/// 「365日越えで surprise·decay → 0、fresh chat の小 surprise·1 が old
+/// high-surprise を demote」挙動。0.5 (v0.3 default) だと high-importance
+/// Decision が無限時間後でも fresh low-importance chat に負けない。
+pub fn ranking(
+    cos_sim: f32,
+    surprise: f32,
+    age_days: f32,
+    half_life_days: f32,
+    decay_floor: f32,
+) -> f32 {
+    let d = decay(age_days, half_life_days).max(decay_floor.clamp(0.0, 1.0));
+    let decayed = surprise * d;
     0.7 * cos_sim.clamp(0.0, 1.0) + 0.3 * decayed.clamp(0.0, 1.0)
 }
 

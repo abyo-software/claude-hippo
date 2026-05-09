@@ -1,6 +1,9 @@
 //! CLI — clap derive。serve / verify / embed / bench。
 
 use crate::embeddings::{Embedder, EmbeddingModelKind, FastEmbedder};
+use crate::server::{
+    RankingConfig, DEFAULT_DECAY_FLOOR, DEFAULT_HALF_LIFE_DAYS, DEFAULT_OVERSAMPLE_FACTOR,
+};
 use crate::surprise::SurpriseWeights;
 use crate::{server, storage, VERSION};
 use clap::{Parser, Subcommand};
@@ -37,6 +40,23 @@ enum Cmd {
         /// Both are 384 dim.
         #[arg(long, env = "HIPPO_EMBEDDING_MODEL")]
         embedding_model: Option<String>,
+        /// Forgetting-curve half-life in days. Default 30. Lower = faster
+        /// decay of old surprise. Set to 0 to disable decay.
+        #[arg(long, env = "HIPPO_HALF_LIFE_DAYS")]
+        half_life_days: Option<f32>,
+        /// Decay floor in 0.0..=1.0. Caps how much the forgetting curve can
+        /// shrink an old item's surprise contribution. Default 0.5 keeps
+        /// high-importance items competitive at any age. Set to 0 to
+        /// reproduce v0.2 behavior (old high-surprise items can be demoted
+        /// by fresh low-surprise items past ~12 half-lives).
+        #[arg(long, env = "HIPPO_DECAY_FLOOR")]
+        decay_floor: Option<f32>,
+        /// Server-wide default for KNN over-fetch multiplier before surprise
+        /// rerank. Default 6 (was 3 in v0.2). Larger values widen the
+        /// rerank candidate pool at the cost of more SQL work. Per-call
+        /// override is also exposed via `RecallParams.oversample_factor`.
+        #[arg(long, env = "HIPPO_OVERSAMPLE_FACTOR")]
+        oversample_factor: Option<usize>,
     },
     /// Open the database, apply schema, verify sqlite-vec, print stats.
     /// Does not read/write any memories. Safe against a live DB.
@@ -65,6 +85,12 @@ enum Cmd {
         surprise_weights: Option<String>,
         #[arg(long, env = "HIPPO_EMBEDDING_MODEL")]
         embedding_model: Option<String>,
+        #[arg(long, env = "HIPPO_HALF_LIFE_DAYS")]
+        half_life_days: Option<f32>,
+        #[arg(long, env = "HIPPO_DECAY_FLOOR")]
+        decay_floor: Option<f32>,
+        #[arg(long, env = "HIPPO_OVERSAMPLE_FACTOR")]
+        oversample_factor: Option<usize>,
     },
 }
 
@@ -96,6 +122,30 @@ fn parse_weights(opt: Option<&str>) -> anyhow::Result<SurpriseWeights> {
     }
 }
 
+fn build_ranking_config(
+    half_life_days: Option<f32>,
+    decay_floor: Option<f32>,
+    oversample_factor: Option<usize>,
+) -> anyhow::Result<RankingConfig> {
+    let hl = half_life_days.unwrap_or(DEFAULT_HALF_LIFE_DAYS);
+    if hl < 0.0 {
+        anyhow::bail!("--half-life-days must be ≥ 0 (0 disables decay), got {hl}");
+    }
+    let floor = decay_floor.unwrap_or(DEFAULT_DECAY_FLOOR);
+    if !(0.0..=1.0).contains(&floor) {
+        anyhow::bail!("--decay-floor must be in 0.0..=1.0, got {floor}");
+    }
+    let factor = oversample_factor.unwrap_or(DEFAULT_OVERSAMPLE_FACTOR);
+    if factor == 0 {
+        anyhow::bail!("--oversample-factor must be ≥ 1, got 0");
+    }
+    Ok(RankingConfig {
+        half_life_days: hl,
+        decay_floor: floor,
+        default_oversample_factor: factor,
+    })
+}
+
 fn build_embedder(
     model_cache: Option<PathBuf>,
     model: EmbeddingModelKind,
@@ -120,6 +170,9 @@ pub async fn run() -> anyhow::Result<()> {
         model_cache: None,
         surprise_weights: None,
         embedding_model: None,
+        half_life_days: None,
+        decay_floor: None,
+        oversample_factor: None,
     });
 
     storage::register_sqlite_vec();
@@ -130,10 +183,14 @@ pub async fn run() -> anyhow::Result<()> {
             model_cache,
             surprise_weights,
             embedding_model,
+            half_life_days,
+            decay_floor,
+            oversample_factor,
         } => {
             let path = db.unwrap_or_else(default_db_path);
             ensure_parent_dir(&path)?;
             let weights = parse_weights(surprise_weights.as_deref())?;
+            let ranking = build_ranking_config(half_life_days, decay_floor, oversample_factor)?;
             let model = parse_model_kind(embedding_model.as_deref())?;
             let store = storage::Storage::open(&path)?;
             let embedder = build_embedder(model_cache, model)?;
@@ -141,9 +198,10 @@ pub async fn run() -> anyhow::Result<()> {
                 ?path,
                 model = model.as_str(),
                 ?weights,
+                ?ranking,
                 "claude-hippo serve starting (rmcp stdio)"
             );
-            server::run_stdio_with_weights(store, embedder, weights).await
+            server::run_stdio_with_config(store, embedder, weights, ranking).await
         }
         Cmd::Verify { db } => {
             let path = db.unwrap_or_else(default_db_path);
@@ -185,10 +243,14 @@ pub async fn run() -> anyhow::Result<()> {
             model_cache,
             surprise_weights,
             embedding_model,
+            half_life_days,
+            decay_floor,
+            oversample_factor,
         } => {
             let weights = parse_weights(surprise_weights.as_deref())?;
+            let ranking = build_ranking_config(half_life_days, decay_floor, oversample_factor)?;
             let model = parse_model_kind(embedding_model.as_deref())?;
-            run_self_bench(n, db, model_cache, weights, model).await
+            run_self_bench(n, db, model_cache, weights, ranking, model).await
         }
     }
 }
@@ -198,6 +260,7 @@ async fn run_self_bench(
     db: Option<PathBuf>,
     model_cache: Option<PathBuf>,
     weights: SurpriseWeights,
+    ranking: RankingConfig,
     model: EmbeddingModelKind,
 ) -> anyhow::Result<()> {
     use std::time::Instant;
@@ -217,7 +280,7 @@ async fn run_self_bench(
     let _ = embedder.embed_one("warmup")?;
     let cold = cold0.elapsed();
 
-    let server = server::MemoryServer::new_with_weights(store, embedder, weights);
+    let server = server::MemoryServer::new_with_config(store, embedder, weights, ranking);
 
     // store N
     let t1 = Instant::now();
@@ -248,6 +311,7 @@ async fn run_self_bench(
                 query: "timing harness memory".into(),
                 limit: 5,
                 no_surprise_boost: false,
+                oversample_factor: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("retrieve err: {:?}", e))?;
@@ -277,6 +341,11 @@ async fn run_self_bench(
         server.weights().w_engagement,
         server.weights().w_explicit,
         server.weights().w_prediction,
+    );
+    let rc = server.ranking_config();
+    println!(
+        "  ranking  : half_life_days={:.1} decay_floor={:.2} oversample_factor={}",
+        rc.half_life_days, rc.decay_floor, rc.default_oversample_factor,
     );
     println!("  cold-start (db open + embed warmup) : {cold:?}");
     println!(

@@ -1,0 +1,91 @@
+[package]
+name = "claude-hippo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["abyo software, LLC <youichi.uda@gmail.com>"]
+description = "Claude Code に海馬を足す MCP サーバ。特異性が高い瞬間だけを長期記憶化する surprise-aware memory store. Pure Rust、SHODH-compatible schema、Apache-2.0/MIT dual-licensed."
+documentation = "https://docs.rs/claude-hippo"
+readme = "README.md"
+homepage = "https://github.com/abyo-software/claude-hippo"
+repository = "https://github.com/abyo-software/claude-hippo"
+license = "Apache-2.0 OR MIT"
+keywords = ["mcp", "memory", "claude", "llm", "embeddings"]
+categories = ["command-line-utilities", "database", "science"]
+
+[[bin]]
+name = "hippo"
+path = "src/main.rs"
+
+[lib]
+name = "claude_hippo"
+path = "src/lib.rs"
+
+[dependencies]
+# MCP SDK (Anthropic 公式 Tier 2)
+rmcp = { version = "1.6", features = ["server", "macros", "transport-io"] }
+
+# DB (mcp-memory-service-rs と schema 互換のため版固定)
+rusqlite = { version = "0.39", features = ["bundled"] }
+sqlite-vec = "0.1.9"
+zerocopy = { version = "0.7", features = ["derive"] }
+
+# Embedding (fastembed: 30+ モデル enum、ort 自動同梱)
+fastembed = "5.13"
+
+# Async runtime
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "io-std", "signal", "fs", "sync"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# Hashing / IDs
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Filesystem
+dirs = "5"
+
+# HTTP (HF mirror fallback for ONNX model)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+
+# Tarball extraction (compat with mcp-memory-service-rs cache)
+tar = "0.4"
+flate2 = "1"
+
+# Concurrency
+once_cell = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+serial_test = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug = true

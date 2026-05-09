@@ -4,6 +4,10 @@ use crate::embeddings::{
     Embedder, EmbeddingBackendKind, EmbeddingModelKind, ExternalEmbedder, ExternalEmbeddingConfig,
     FastEmbedder,
 };
+use crate::prediction_loss::{
+    ExternalPredictionLossBackend, ExternalPredictionLossConfig, PredictionLossBackend,
+    PredictionLossBackendKind, DEFAULT_LOSS_SCALE,
+};
 use crate::server::{
     RankingConfig, DEFAULT_DECAY_FLOOR, DEFAULT_HALF_LIFE_DAYS, DEFAULT_OVERSAMPLE_FACTOR,
 };
@@ -69,6 +73,58 @@ impl EmbeddingFlags {
     }
 }
 
+/// CLI flags for the optional prediction-loss backend
+/// (`SurpriseComponents.prediction_loss`). Default: `none` (v0.2 behavior:
+/// `w_prediction` is redistributed across outlier + engagement). Set to
+/// `openai-compat` to score content against an `/v1/completions`-style
+/// endpoint that supports `echo + max_tokens=0 + logprobs` (vLLM,
+/// llama.cpp, legacy OpenAI completions).
+#[derive(Args, Debug, Clone)]
+struct PredictionLossFlags {
+    /// `none` (default) or `openai-compat`. When `openai-compat`,
+    /// `--prediction-loss-url` and `--prediction-loss-model` are required.
+    #[arg(long, env = "HIPPO_PREDICTION_LOSS_BACKEND")]
+    prediction_loss_backend: Option<String>,
+
+    /// Legacy `/v1/completions`-compatible URL.
+    #[arg(long, env = "HIPPO_PREDICTION_LOSS_URL")]
+    prediction_loss_url: Option<String>,
+
+    /// Model id (e.g. `gpt-3.5-turbo-instruct` for legacy OpenAI; vLLM
+    /// uses the loaded model id).
+    #[arg(long, env = "HIPPO_PREDICTION_LOSS_MODEL")]
+    prediction_loss_model: Option<String>,
+
+    /// Env var name to read the API key from. `NONE` skips the
+    /// `Authorization` header (keyless local backends). Default
+    /// `OPENAI_API_KEY`.
+    #[arg(long, env = "HIPPO_PREDICTION_LOSS_API_KEY_ENV")]
+    prediction_loss_api_key_env: Option<String>,
+
+    /// Per-request timeout (ms). Default 5000.
+    #[arg(long, env = "HIPPO_PREDICTION_LOSS_TIMEOUT_MS")]
+    prediction_loss_timeout_ms: Option<u64>,
+
+    /// Retries on 429/5xx/network. Default 3.
+    #[arg(long, env = "HIPPO_PREDICTION_LOSS_MAX_RETRIES")]
+    prediction_loss_max_retries: Option<u32>,
+
+    /// Cross-entropy scale (nats / token) used to map mean NLL to [0,1].
+    /// Default 6.0. Lower = more sensitive (most content scores high);
+    /// higher = less sensitive.
+    #[arg(long, env = "HIPPO_PREDICTION_LOSS_SCALE")]
+    prediction_loss_scale: Option<f32>,
+}
+
+impl PredictionLossFlags {
+    fn backend_kind(&self) -> anyhow::Result<PredictionLossBackendKind> {
+        match self.prediction_loss_backend.as_deref() {
+            None => Ok(PredictionLossBackendKind::default()),
+            Some(s) => PredictionLossBackendKind::parse(s).map_err(|e| anyhow::anyhow!(e)),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "hippo", version = VERSION,
           about = "Claude Code に海馬を足す MCP server (claude-hippo)",
@@ -96,6 +152,8 @@ enum Cmd {
         surprise_weights: Option<String>,
         #[command(flatten)]
         embed: EmbeddingFlags,
+        #[command(flatten)]
+        prediction: PredictionLossFlags,
         /// Forgetting-curve half-life in days. Default 30. Lower = faster
         /// decay of old surprise. Set to 0 to disable decay.
         #[arg(long, env = "HIPPO_HALF_LIFE_DAYS")]
@@ -141,6 +199,8 @@ enum Cmd {
         surprise_weights: Option<String>,
         #[command(flatten)]
         embed: EmbeddingFlags,
+        #[command(flatten)]
+        prediction: PredictionLossFlags,
         #[arg(long, env = "HIPPO_HALF_LIFE_DAYS")]
         half_life_days: Option<f32>,
         #[arg(long, env = "HIPPO_DECAY_FLOOR")]
@@ -228,6 +288,67 @@ fn build_embedder_from_flags(
     }
 }
 
+fn build_prediction_loss_backend(
+    flags: &PredictionLossFlags,
+) -> anyhow::Result<Option<Arc<dyn PredictionLossBackend>>> {
+    match flags.backend_kind()? {
+        PredictionLossBackendKind::None => Ok(None),
+        PredictionLossBackendKind::OpenAiCompat => {
+            let url = flags
+                .prediction_loss_url
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "--prediction-loss-url is required when --prediction-loss-backend=openai-compat \
+                     (or set HIPPO_PREDICTION_LOSS_URL)"
+                ))?;
+            let model = flags
+                .prediction_loss_model
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "--prediction-loss-model is required when --prediction-loss-backend=openai-compat \
+                     (or set HIPPO_PREDICTION_LOSS_MODEL)"
+                ))?;
+            let key_env = flags
+                .prediction_loss_api_key_env
+                .clone()
+                .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+            let api_key = if key_env.eq_ignore_ascii_case("none") || key_env.is_empty() {
+                String::new()
+            } else {
+                std::env::var(&key_env).unwrap_or_default()
+            };
+            let cfg = ExternalPredictionLossConfig {
+                url,
+                model,
+                api_key,
+                timeout: Duration::from_millis(flags.prediction_loss_timeout_ms.unwrap_or(5_000)),
+                max_retries: flags.prediction_loss_max_retries.unwrap_or(3),
+                loss_scale: flags.prediction_loss_scale.unwrap_or(DEFAULT_LOSS_SCALE),
+            };
+            let backend = ExternalPredictionLossBackend::new(cfg)
+                .map_err(|e: HippoError| anyhow::anyhow!(e))?;
+            Ok(Some(Arc::new(backend)))
+        }
+    }
+}
+
+fn prediction_loss_label(flags: &PredictionLossFlags) -> String {
+    match flags.backend_kind().unwrap_or_default() {
+        PredictionLossBackendKind::None => "none".into(),
+        PredictionLossBackendKind::OpenAiCompat => format!(
+            "openai-compat:{}@{}",
+            flags
+                .prediction_loss_model
+                .as_deref()
+                .unwrap_or("(missing-model)"),
+            flags
+                .prediction_loss_url
+                .as_deref()
+                .unwrap_or("(missing-url)"),
+        ),
+    }
+}
+
 fn embedding_backend_label(flags: &EmbeddingFlags) -> String {
     match flags.backend_kind().unwrap_or_default() {
         EmbeddingBackendKind::Local => {
@@ -312,6 +433,15 @@ pub async fn run() -> anyhow::Result<()> {
             external_embedding_batch_size: None,
             external_embedding_max_retries: None,
         },
+        prediction: PredictionLossFlags {
+            prediction_loss_backend: None,
+            prediction_loss_url: None,
+            prediction_loss_model: None,
+            prediction_loss_api_key_env: None,
+            prediction_loss_timeout_ms: None,
+            prediction_loss_max_retries: None,
+            prediction_loss_scale: None,
+        },
         half_life_days: None,
         decay_floor: None,
         oversample_factor: None,
@@ -325,6 +455,7 @@ pub async fn run() -> anyhow::Result<()> {
             model_cache,
             surprise_weights,
             embed,
+            prediction,
             half_life_days,
             decay_floor,
             oversample_factor,
@@ -334,16 +465,19 @@ pub async fn run() -> anyhow::Result<()> {
             let weights = parse_weights(surprise_weights.as_deref())?;
             let ranking = build_ranking_config(half_life_days, decay_floor, oversample_factor)?;
             let backend_label = embedding_backend_label(&embed);
+            let pl_label = prediction_loss_label(&prediction);
             let store = storage::Storage::open(&path)?;
             let embedder = build_embedder_from_flags(&embed, model_cache)?;
+            let pl_backend = build_prediction_loss_backend(&prediction)?;
             tracing::info!(
                 ?path,
                 backend = backend_label.as_str(),
+                prediction_loss = pl_label.as_str(),
                 ?weights,
                 ?ranking,
                 "claude-hippo serve starting (rmcp stdio)"
             );
-            server::run_stdio_with_config(store, embedder, weights, ranking).await
+            server::run_stdio_full(store, embedder, pl_backend, weights, ranking).await
         }
         Cmd::Verify { db } => {
             let path = db.unwrap_or_else(default_db_path);
@@ -385,13 +519,14 @@ pub async fn run() -> anyhow::Result<()> {
             model_cache,
             surprise_weights,
             embed,
+            prediction,
             half_life_days,
             decay_floor,
             oversample_factor,
         } => {
             let weights = parse_weights(surprise_weights.as_deref())?;
             let ranking = build_ranking_config(half_life_days, decay_floor, oversample_factor)?;
-            run_self_bench(n, db, model_cache, weights, ranking, embed).await
+            run_self_bench(n, db, model_cache, weights, ranking, embed, prediction).await
         }
     }
 }
@@ -403,6 +538,7 @@ async fn run_self_bench(
     weights: SurpriseWeights,
     ranking: RankingConfig,
     embed_flags: EmbeddingFlags,
+    pl_flags: PredictionLossFlags,
 ) -> anyhow::Result<()> {
     use std::time::Instant;
     let db_path = db.unwrap_or_else(|| {
@@ -415,14 +551,16 @@ async fn run_self_bench(
     let _ = std::fs::remove_file(&db_path);
 
     let backend_label = embedding_backend_label(&embed_flags);
+    let pl_label = prediction_loss_label(&pl_flags);
     let cold0 = Instant::now();
     let store = storage::Storage::open(&db_path)?;
     let embedder = build_embedder_from_flags(&embed_flags, model_cache)?;
+    let pl_backend = build_prediction_loss_backend(&pl_flags)?;
     // first embed = model load (local) / first request (external)
     let _ = embedder.embed_one("warmup")?;
     let cold = cold0.elapsed();
 
-    let server = server::MemoryServer::new_with_config(store, embedder, weights, ranking);
+    let server = server::MemoryServer::new_full(store, embedder, pl_backend, weights, ranking);
 
     // store N
     let t1 = Instant::now();
@@ -476,7 +614,8 @@ async fn run_self_bench(
     let rss_kb = read_self_rss_kb().unwrap_or(0);
 
     println!("claude-hippo self-bench ✓");
-    println!("  backend  : {backend_label}");
+    println!("  backend     : {backend_label}");
+    println!("  prediction  : {pl_label}");
     println!(
         "  weights  : outlier={:.2} engagement={:.2} explicit={:.2} prediction={:.2}",
         server.weights().w_outlier,

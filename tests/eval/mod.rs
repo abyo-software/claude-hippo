@@ -26,8 +26,9 @@
 #![allow(dead_code)]
 
 use claude_hippo::embeddings::Embedder;
+use claude_hippo::prediction_loss::PredictionLossBackend;
 use claude_hippo::server::{
-    MemoryServer, RecallOptions, RecallParams, RememberParams, RememberResult,
+    MemoryServer, RankingConfig, RecallOptions, RecallParams, RememberParams, RememberResult,
 };
 use claude_hippo::storage::Storage;
 use claude_hippo::surprise::SurpriseWeights;
@@ -168,7 +169,7 @@ pub struct AblationResult {
     pub with_surprise: Metrics,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EvalConfig {
     pub items: Vec<EvalItem>,
     pub queries: Vec<EvalQuery>,
@@ -193,6 +194,13 @@ pub struct EvalConfig {
     /// rerank a wider candidate pool. Default 3 matches production. Set
     /// `num_items / k` to fully disable the over-fetch ceiling.
     pub oversample_factor: usize,
+    /// Optional prediction-loss backend. When `None`, the run uses the v0.2
+    /// fallback (`prediction_loss = None`, `w_prediction` redistributed).
+    /// When `Some`, every `remember()` populates `prediction_loss` from the
+    /// backend and the surprise score uses the full 4-component formula.
+    /// Bench D exercises this; A/B/C leave it `None` for v0.2 parity.
+    #[allow(clippy::type_complexity)]
+    pub prediction_loss: Option<Arc<dyn PredictionLossBackend>>,
 }
 
 pub async fn run_ablation(cfg: EvalConfig) -> anyhow::Result<AblationResult> {
@@ -219,7 +227,13 @@ async fn run_one(cfg: &EvalConfig, no_surprise_boost: bool) -> anyhow::Result<Me
     let embedder: Arc<dyn Embedder> = Arc::new(embedder);
 
     let store = Storage::open_in_memory()?;
-    let server = MemoryServer::new_with_weights(store, embedder, cfg.weights);
+    let server = MemoryServer::new_full(
+        store,
+        embedder,
+        cfg.prediction_loss.clone(),
+        cfg.weights,
+        RankingConfig::default(),
+    );
 
     // Insert items in deterministic order. content_hash uniqueness assumed
     // (fixtures must avoid duplicate content strings).

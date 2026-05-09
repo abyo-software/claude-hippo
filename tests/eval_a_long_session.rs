@@ -117,6 +117,7 @@ fn build_config(oversample_factor: usize) -> EvalConfig {
         fallback_cluster: TOPICS.len(),
         noise_scale: 0.05,
         oversample_factor,
+        prediction_loss: None,
     }
 }
 

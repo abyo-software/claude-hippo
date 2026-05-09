@@ -14,6 +14,15 @@
 - `RankingConfig` 構造体 + `MemoryServer::new_with_config(...)` / `server::run_stdio_with_config(...)` — 上記 3 ノブを 1 か所にまとめた server-wide config
 - `RecallParams.oversample_factor: Option<usize>` を MCP schema に expose（v0.2 では `RecallOptions` 内のみで eval-only）
 
+**Phase C — Prediction-loss backend**:
+- `src/prediction_loss/` 新規 module — `PredictionLossBackend` trait + `PredictionLossBackendKind { None, OpenAiCompat }` enum + `MockPredictionLoss` (テスト用 SHA256 deterministic) + `ExternalPredictionLossBackend` (OpenAI legacy `/v1/completions` 互換、`echo + max_tokens=0 + logprobs`)
+- `MemoryServer::new_full(...)` + `server::run_stdio_full(...)` で optional な backend を受け、`remember()` フローが `surprise_components.prediction_loss = Some(value)` を埋める。backend が `None` の時は v0.2 fallback (`w_prediction` 再分配)
+- CLI: `--prediction-loss-backend {none, openai-compat}` + `--prediction-loss-{url,model,api-key-env,timeout-ms,max-retries,scale}` (env 全対応)
+- mean NLL → surprise マッピング: `clamp(mean_nll / loss_scale, 0, 1)` 既定 scale = 6.0 nats/token
+- 9 wiremock integration tests (`tests/prediction_loss.rs`): mean NLL scaling / clamp upper / clamp lower / 空 content short-circuit / logprobs 欠落の actionable error / 401 fail-fast / 429 retry / MemoryServer end-to-end (with/without backend)
+- Bench D 追加 (`tests/eval_d_prediction_loss.rs`): MockPredictionLoss で wiring smoke (coverage 100/100)、`target/eval_results/bench_d_prediction_loss.json` 出力。実 LLM 数値は release-time smoke 送り (Ollama/vLLM が必要)
+- 対応 backend: vLLM `/v1/completions`、llama.cpp `/completion`、Ollama (shim)、legacy OpenAI Completions。OpenAI Chat Completions は prompt logprobs を返さないため非対応
+
 **Phase B — External embedding backend**:
 - **`--embedding-backend {local,external}`** + **`--external-embedding-{url,model,api-key-env,timeout-ms,batch-size,max-retries}`** + 全対応 env (`HIPPO_EXTERNAL_EMBEDDING_*`)
 - `src/embeddings/` を module 化、新規 `external.rs` で OpenAI 互換 `/v1/embeddings` HTTP backend (reqwest + rustls-tls、L2 正規化強制、384 dim 検証 fail-loud、indexed re-order、429/5xx exponential backoff、batch chunking)
@@ -24,10 +33,12 @@
 - `examples/bench_external_rss.rs` — wiremock in-process で **peak RSS = 25.7 MB** 実測（target <30 MB **MET**）。store p50 0.57 ms / retrieve p50 0.75 ms（ローカルmock基準）
 
 ### Planned (v0.3 残)
-- `prediction_loss` を OpenAI 互換 logprobs HTTP backend で実値化（abyo-llm-probe Rust crate 未存在のため Path 3、native candle-rs 移植は v0.4）
 - 多 MCP client 動作確認（Cursor / Continue / Aider）
 - Anthropic Memory Tool 互換レイヤ
 - SHODH OpenAPI REST 互換 endpoint (`--shodh-rest`)
+
+### Planned (v0.4)
+- candle-rs native local prediction-loss backend (no external HTTP service required, GPU 持ち向け)。abyo-llm-probe Stage 2 (Vast.ai 4090) 完走後に判断
 
 ## [0.2.0] - 2026-05-10
 

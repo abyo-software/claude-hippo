@@ -236,8 +236,8 @@ ls target/eval_results/
 - [x] **v0.3 Phase A**: `--half-life-days` + env `HIPPO_HALF_LIFE_DAYS` (既定 30、0 で disable)
 - [x] **v0.3 Phase A**: `--decay-floor` + env `HIPPO_DECAY_FLOOR` (既定 0.5、0 で v0.2 挙動に戻す)。`surprise · max(decay, floor)` 形式で blending
 - [x] **v0.3 Phase A**: `--oversample-factor` + env `HIPPO_OVERSAMPLE_FACTOR` (既定 6、was 3)、`RecallParams.oversample_factor: Option<usize>` を MCP schema に expose
-- [ ] **v0.3 Phase B**: `--embedding-backend external` (`docs/EXTERNAL_EMBEDDING.md`)
-- [ ] **v0.3 Phase C**: `--prediction-loss-backend openai-compat` で `prediction_loss` を実値化
+- [x] **v0.3 Phase B**: `--embedding-backend external` (OpenAI/Ollama/vLLM/HF TEI 互換)、9 wiremock test、RSS 25.7 MB 実測
+- [x] **v0.3 Phase C**: `--prediction-loss-backend openai-compat` で `prediction_loss` を実値化 (vLLM/llama.cpp/Ollama)、9 wiremock test、Bench D wiring smoke。実 LLM 数値は release smoke 送り、candle-rs native は v0.4
 
 ---
 
@@ -246,7 +246,7 @@ ls target/eval_results/
 1. **Engagement ヒューリスティックは外す**: 短文だが超重要な決定（例: `"go ahead"`）を埋もれさせる可能性。`importance` で補える。Bench C は importance=1.0 を前提にしているため、explicit signal がないケースでは効果は弱まる。
 2. **Embedding outlier は cluster の中心が近いと低く出る**: 同種の決定が大量にある時、新しい決定が「すでにある」と判定される。Bench A の chat-vs-decision の outlier 差は engagement 経路で稼いでいる。
 3. **(解決済 — v0.3 Phase A)** Forgetting curve `half_life=30 days` ハードコード + 365 日越え demotion: v0.2 では Bench B 365d で fresh chat に追い越される（負の lift）挙動。v0.3 で `--half-life-days` (CLI/env, 既定 30) + `--decay-floor` (既定 0.5) を追加し、`surprise · max(decay, decay_floor)` で構造的解決。Bench B 365d が **negative lift → +0.875** に flip。
-4. **`prediction_loss` 未実装**: v0.2 は w_p を再分配で吸収しているが、本来の差別化は abyo-llm-probe 統合後（v0.3）に発揮される。Bench C で w_explicit=0.5 にすると recall が ideal の 1.000 に達することから、prediction_loss を埋めれば更に上に伸びる余地あり。
+4. **(v0.3 で wiring 完了)** `prediction_loss`: v0.3 で `--prediction-loss-backend openai-compat` (vLLM / llama.cpp / Ollama / legacy OpenAI completions 互換) を追加し、`SurpriseComponents.prediction_loss` を実値で埋められる経路を提供。`backend = none` (既定) では v0.2 fallback (w_prediction を outlier+engagement に再分配)。**実 LLM での bench 数値は release-time smoke 送り** (Bench D は MockPredictionLoss で wiring smoke のみ)。candle-rs native backend は v0.4 候補
 5. **mcp-memory-service-rs / Python upstream は surprise score を読まない**: DB swap 時、彼らの retrieve は素の cosine sim になる。これは仕様（互換のため）。彼らへ swap した瞬間に Bench A の baseline 数値に劣化する想定。
 6. **(解決済 — v0.3 Phase A)** Default `oversample_factor=3` の取りこぼし: v0.2 では Bench A 既定で 72% 頭打ち。v0.3 で `default_oversample_factor` を 3→6 に bump、`RecallParams.oversample_factor: Option<usize>` を MCP schema に expose、CLI `--oversample-factor` + env `HIPPO_OVERSAMPLE_FACTOR` 追加。Bench A 既定で **precision@1 = 1.000**。
 

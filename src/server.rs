@@ -9,6 +9,7 @@
 //! - `ping`: health probe (vec_version, memory_count を返す)
 
 use crate::embeddings::Embedder;
+use crate::prediction_loss::PredictionLossBackend;
 use crate::storage::{self, MemoryRow, Storage};
 use crate::surprise::{self, SurpriseComponents, SurpriseWeights};
 use rmcp::{
@@ -78,6 +79,9 @@ pub struct MemoryServer {
     tool_router: ToolRouter<Self>,
     storage: Arc<Mutex<Storage>>,
     embedder: Arc<dyn Embedder>,
+    /// Optional backend for filling `SurpriseComponents.prediction_loss`.
+    /// `None` falls back to the v0.2 redistribution behavior.
+    prediction_loss: Option<Arc<dyn PredictionLossBackend>>,
     weights: SurpriseWeights,
     ranking: RankingConfig,
     started_at: std::time::Instant,
@@ -246,10 +250,24 @@ impl MemoryServer {
         weights: SurpriseWeights,
         ranking: RankingConfig,
     ) -> Self {
+        Self::new_full(storage, embedder, None, weights, ranking)
+    }
+
+    /// Full constructor including the optional prediction-loss backend.
+    /// Used by [`run_stdio_full`] and the CLI when
+    /// `--prediction-loss-backend` is set to a non-`none` value.
+    pub fn new_full(
+        storage: Storage,
+        embedder: Arc<dyn Embedder>,
+        prediction_loss: Option<Arc<dyn PredictionLossBackend>>,
+        weights: SurpriseWeights,
+        ranking: RankingConfig,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             storage: Arc::new(Mutex::new(storage)),
             embedder,
+            prediction_loss,
             weights,
             ranking,
             started_at: std::time::Instant::now(),
@@ -262,6 +280,10 @@ impl MemoryServer {
 
     pub fn ranking_config(&self) -> RankingConfig {
         self.ranking
+    }
+
+    pub fn has_prediction_loss_backend(&self) -> bool {
+        self.prediction_loss.is_some()
     }
 
     /// **Tests / advanced use only.** Returns the underlying storage Arc for
@@ -425,11 +447,26 @@ impl MemoryServer {
         let outlier = surprise::embedding_outlier(&embedding, &history_emb);
         let engagement = surprise::engagement(&p.content, p.tags.len());
         let explicit = surprise::explicit(p.importance);
+        // v0.3: if a prediction-loss backend is wired (--prediction-loss-backend
+        // openai-compat), score the content's predictability and feed it into
+        // the surprise score. Otherwise leave it None and the score formula
+        // re-distributes w_prediction onto outlier + engagement (v0.2 fallback).
+        let prediction_loss = if let Some(pl) = &self.prediction_loss {
+            match pl.predict_loss(&p.content) {
+                Ok(v) => Some(v.clamp(0.0, 1.0)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "prediction_loss backend failed; falling back to None");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let comps = SurpriseComponents {
             embedding_outlier: outlier,
             engagement,
             explicit,
-            prediction_loss: None, // abyo-llm-probe 統合 (v0.3) で埋まる
+            prediction_loss,
         };
         let score = surprise::score(&comps, &self.weights);
 
@@ -755,7 +792,17 @@ pub async fn run_stdio_with_config(
     weights: SurpriseWeights,
     ranking: RankingConfig,
 ) -> anyhow::Result<()> {
-    let server = MemoryServer::new_with_config(storage, embedder, weights, ranking);
+    run_stdio_full(storage, embedder, None, weights, ranking).await
+}
+
+pub async fn run_stdio_full(
+    storage: Storage,
+    embedder: Arc<dyn Embedder>,
+    prediction_loss: Option<Arc<dyn PredictionLossBackend>>,
+    weights: SurpriseWeights,
+    ranking: RankingConfig,
+) -> anyhow::Result<()> {
+    let server = MemoryServer::new_full(storage, embedder, prediction_loss, weights, ranking);
     let service = server
         .serve(stdio())
         .await

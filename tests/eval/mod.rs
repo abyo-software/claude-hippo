@@ -277,6 +277,8 @@ async fn run_one(cfg: &EvalConfig, no_surprise_boost: bool) -> anyhow::Result<Me
                     limit: cfg.k,
                     no_surprise_boost,
                     oversample_factor: None,
+                    mode: None,
+                    seed_id: None,
                 },
                 opts,
             )

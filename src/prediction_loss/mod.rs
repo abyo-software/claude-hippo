@@ -48,17 +48,17 @@
 
 use crate::Result;
 
-pub mod external;
 #[cfg(feature = "candle")]
 pub mod candle_local;
+pub mod external;
 
-pub use external::{
-    ExternalPredictionLossBackend, ExternalPredictionLossConfig, DEFAULT_LOSS_SCALE,
-};
 #[cfg(feature = "candle")]
 pub use candle_local::{
     CandleLocalConfig, CandleLocalPredictionLoss, DEFAULT_CANDLE_MODEL_ID,
     DEFAULT_LOSS_SCALE as CANDLE_DEFAULT_LOSS_SCALE,
+};
+pub use external::{
+    ExternalPredictionLossBackend, ExternalPredictionLossConfig, DEFAULT_LOSS_SCALE,
 };
 
 /// Scores the surprise of arbitrary content via an LLM. Sync trait — like

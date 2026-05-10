@@ -189,6 +189,17 @@ enum Cmd {
         /// override is also exposed via `RecallParams.oversample_factor`.
         #[arg(long, env = "HIPPO_OVERSAMPLE_FACTOR")]
         oversample_factor: Option<usize>,
+        /// v0.5 Phase B: disable Hebbian co-recall reinforcement. By
+        /// default, every recall returning ≥2 results bumps the
+        /// `memory_associations` edge weight between every unordered
+        /// pair. Disable for read-only benchmarking or when DB write
+        /// amplification is unacceptable.
+        #[arg(long, env = "HIPPO_NO_HEBBIAN_REINFORCE")]
+        no_hebbian_reinforce: bool,
+        /// v0.5 Phase B: per-co-recall edge increment. Default 0.1.
+        /// Capped at 1.0 by the storage layer.
+        #[arg(long, env = "HIPPO_CO_RECALL_ALPHA")]
+        co_recall_alpha: Option<f32>,
         /// Expose the Anthropic Memory Tool compatibility surface (a
         /// filesystem-shaped `memory` MCP tool with view/create/str_replace/
         /// insert/delete/rename commands under `/memories`). Off by default
@@ -244,6 +255,10 @@ enum Cmd {
         decay_floor: Option<f32>,
         #[arg(long, env = "HIPPO_OVERSAMPLE_FACTOR")]
         oversample_factor: Option<usize>,
+        #[arg(long, env = "HIPPO_NO_HEBBIAN_REINFORCE")]
+        no_hebbian_reinforce: bool,
+        #[arg(long, env = "HIPPO_CO_RECALL_ALPHA")]
+        co_recall_alpha: Option<f32>,
     },
 }
 
@@ -460,6 +475,8 @@ fn build_ranking_config(
     half_life_days: Option<f32>,
     decay_floor: Option<f32>,
     oversample_factor: Option<usize>,
+    no_hebbian_reinforce: bool,
+    co_recall_alpha: Option<f32>,
 ) -> anyhow::Result<RankingConfig> {
     let hl = half_life_days.unwrap_or(DEFAULT_HALF_LIFE_DAYS);
     if hl < 0.0 {
@@ -473,10 +490,16 @@ fn build_ranking_config(
     if factor == 0 {
         anyhow::bail!("--oversample-factor must be ≥ 1, got 0");
     }
+    let alpha = co_recall_alpha.unwrap_or(crate::server::DEFAULT_CO_RECALL_ALPHA);
+    if !(0.0..=1.0).contains(&alpha) {
+        anyhow::bail!("--co-recall-alpha must be in 0.0..=1.0, got {alpha}");
+    }
     Ok(RankingConfig {
         half_life_days: hl,
         decay_floor: floor,
         default_oversample_factor: factor,
+        reinforce_co_recall: !no_hebbian_reinforce,
+        co_recall_alpha: alpha,
     })
 }
 
@@ -528,6 +551,8 @@ pub async fn run() -> anyhow::Result<()> {
         half_life_days: None,
         decay_floor: None,
         oversample_factor: None,
+        no_hebbian_reinforce: false,
+        co_recall_alpha: None,
         anthropic_memory_tool: false,
         shodh_rest: false,
         shodh_rest_bind: None,
@@ -545,6 +570,8 @@ pub async fn run() -> anyhow::Result<()> {
             half_life_days,
             decay_floor,
             oversample_factor,
+            no_hebbian_reinforce,
+            co_recall_alpha,
             anthropic_memory_tool,
             shodh_rest,
             shodh_rest_bind,
@@ -552,7 +579,13 @@ pub async fn run() -> anyhow::Result<()> {
             let path = db.unwrap_or_else(default_db_path);
             ensure_parent_dir(&path)?;
             let weights = parse_weights(surprise_weights.as_deref())?;
-            let ranking = build_ranking_config(half_life_days, decay_floor, oversample_factor)?;
+            let ranking = build_ranking_config(
+                half_life_days,
+                decay_floor,
+                oversample_factor,
+                no_hebbian_reinforce,
+                co_recall_alpha,
+            )?;
             let backend_label = embedding_backend_label(&embed);
             let pl_label = prediction_loss_label(&prediction);
             let store = storage::Storage::open(&path)?;
@@ -624,9 +657,17 @@ pub async fn run() -> anyhow::Result<()> {
             half_life_days,
             decay_floor,
             oversample_factor,
+            no_hebbian_reinforce,
+            co_recall_alpha,
         } => {
             let weights = parse_weights(surprise_weights.as_deref())?;
-            let ranking = build_ranking_config(half_life_days, decay_floor, oversample_factor)?;
+            let ranking = build_ranking_config(
+                half_life_days,
+                decay_floor,
+                oversample_factor,
+                no_hebbian_reinforce,
+                co_recall_alpha,
+            )?;
             run_self_bench(n, db, model_cache, weights, ranking, embed, prediction).await
         }
     }
@@ -777,6 +818,8 @@ async fn run_self_bench(
                 limit: 5,
                 no_surprise_boost: false,
                 oversample_factor: None,
+                mode: None,
+                seed_id: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("retrieve err: {:?}", e))?;

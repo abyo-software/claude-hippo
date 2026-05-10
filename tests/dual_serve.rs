@@ -67,6 +67,8 @@ async fn rest_and_direct_share_storage() {
             limit: 5,
             no_surprise_boost: false,
             oversample_factor: None,
+            mode: None,
+            seed_id: None,
         })
         .await
         .unwrap();
@@ -129,6 +131,8 @@ async fn writes_through_either_instance_are_visible_to_both() {
                 limit: 5,
                 no_surprise_boost: true, // pure cosine, deterministic
                 oversample_factor: None,
+                mode: None,
+                seed_id: None,
             })
             .await
             .unwrap();

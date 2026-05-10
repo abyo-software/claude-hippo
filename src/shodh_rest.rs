@@ -398,6 +398,8 @@ async fn handle_context(
             limit: p.limit.unwrap_or(5),
             no_surprise_boost: false,
             oversample_factor: None,
+            mode: None,
+            seed_id: None,
         })
         .await
     {
@@ -410,21 +412,19 @@ async fn handle_context(
     }
 }
 
-// ---------- consolidate (v0.4 Phase B-1) ----------
+// ---------- consolidate (v0.4 Phase B-1, extended in v0.5 Phase B) ----------
 //
 // SHODH `/api/consolidate` is documented to do four things:
 //
 // 1. **exponential decay scoring** — recompute time-decayed surprise per memory
-// 2. **quality-based archival of low-value memories** — soft-delete items whose
-//    decayed surprise has fallen below a threshold and are old enough to not
-//    be "fresh chat noise the user might still touch"
-// 3. **association discovery between memories** — Hebbian edges (deferred to
-//    v0.5; needs a new `memory_associations` table per docs/SHODH_COMPAT.md §5)
-// 4. **semantic clustering and compression** — also deferred (touches storage
-//    schema in non-trivial ways)
-//
-// v0.4 implements (1) + (2) honestly and stubs (3) + (4) in the response so
-// callers know which features are wired vs deferred.
+//    (v0.4)
+// 2. **quality-based archival of low-value memories** — soft-delete items
+//    whose decayed surprise has fallen below a threshold and are old enough
+//    not to be "fresh chat noise the user might still touch" (v0.4)
+// 3. **association discovery between memories** — Hebbian edges (v0.5: edges
+//    are *grown* on the read path via co-recall reinforcement; consolidate
+//    decays + prunes them to keep the graph sparse)
+// 4. **semantic clustering and compression** — still deferred (Phase C)
 
 #[derive(Deserialize, Default)]
 struct ConsolidateRequest {
@@ -442,9 +442,16 @@ struct ConsolidateRequest {
     #[serde(default)]
     limit: Option<i64>,
     /// When true, don't actually soft-delete — just report what would have
-    /// been archived.
+    /// been archived. Edge prune still runs in dry-run, so caller can see
+    /// the steady-state edge count.
     #[serde(default)]
     dry_run: bool,
+    /// v0.5: drop edges whose decayed weight falls below this. Default
+    /// 0.01 (matches SHODH spec's "weak association" cutoff). Set to 0
+    /// to keep all edges (the dangling-edge sweep against soft-deleted
+    /// memories still runs).
+    #[serde(default)]
+    edge_prune_threshold: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -458,9 +465,15 @@ struct ConsolidateReply {
     total_alive_after: i64,
     /// True iff caller passed `dry_run = true`.
     dry_run: bool,
+    /// v0.5: number of `memory_associations` rows removed (decay below
+    /// threshold OR pointing to a soft-deleted memory).
+    pruned_edges: i64,
+    /// v0.5: total alive edges after this call's prune.
+    associations_total: i64,
     /// Honest disclosure: SHODH spec lists association discovery and
-    /// semantic clustering under "consolidate". v0.4 implements decay-based
-    /// archival only; the other two are deferred.
+    /// semantic clustering under "consolidate". v0.5 wires association
+    /// discovery (Hebbian edges grown on the read path, decayed/pruned
+    /// here). Semantic clustering is still deferred.
     deferred: Vec<&'static str>,
 }
 
@@ -530,6 +543,15 @@ async fn handle_consolidate(
         store.count_alive().unwrap_or(total_before)
     };
 
+    // v0.5 Phase B: edge decay + prune. Reuses memory half-life for edge
+    // half-life — the conceptual unit is the same ("how long does
+    // co-activation matter"), and gives admins a single knob.
+    let edge_threshold = req.edge_prune_threshold.unwrap_or(0.01).clamp(0.0, 1.0);
+    let pruned_edges = store
+        .prune_associations(half_life, edge_threshold, now)
+        .unwrap_or(0);
+    let associations_total = store.count_associations().unwrap_or(0);
+
     (
         StatusCode::OK,
         Json(ConsolidateReply {
@@ -537,7 +559,9 @@ async fn handle_consolidate(
             total_alive_before: total_before,
             total_alive_after: total_after,
             dry_run: req.dry_run,
-            deferred: vec!["association_discovery", "semantic_clustering"],
+            pruned_edges,
+            associations_total,
+            deferred: vec!["semantic_clustering"],
         }),
     )
         .into_response()
@@ -1112,14 +1136,18 @@ mod tests {
         assert_eq!(v["archived"].as_array().unwrap().len(), 4);
         assert_eq!(v["total_alive_before"], 4);
         assert_eq!(v["total_alive_after"], 0);
-        // Honest disclosure: association_discovery + semantic_clustering deferred.
+        // v0.5: only semantic_clustering remains deferred — association
+        // discovery is wired (edges grown on read, decayed/pruned here).
         let deferred: Vec<&str> = v["deferred"]
             .as_array()
             .unwrap()
             .iter()
             .map(|s| s.as_str().unwrap())
             .collect();
-        assert!(deferred.contains(&"association_discovery"));
+        assert!(!deferred.contains(&"association_discovery"));
         assert!(deferred.contains(&"semantic_clustering"));
+        // Edge prune fields must surface even when no edges exist.
+        assert_eq!(v["pruned_edges"], 0);
+        assert_eq!(v["associations_total"], 0);
     }
 }

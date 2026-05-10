@@ -89,9 +89,7 @@ impl Default for CandleLocalConfig {
 impl CandleLocalConfig {
     pub fn validate(&self) -> Result<()> {
         if self.model_id.is_empty() {
-            return Err(HippoError::Config(
-                "candle_local model_id is empty".into(),
-            ));
+            return Err(HippoError::Config("candle_local model_id is empty".into()));
         }
         if !self.loss_scale.is_finite() || self.loss_scale <= 0.0 {
             return Err(HippoError::Config(format!(
@@ -126,8 +124,7 @@ impl CandleLocalPredictionLoss {
             "loading candle-rs prediction-loss backend"
         );
 
-        let api =
-            Api::new().map_err(|e| HippoError::Config(format!("hf-hub api: {e}")))?;
+        let api = Api::new().map_err(|e| HippoError::Config(format!("hf-hub api: {e}")))?;
         let repo = api.model(cfg.model_id.clone());
 
         let tokenizer_path = repo
@@ -142,8 +139,11 @@ impl CandleLocalPredictionLoss {
 
         let raw = std::fs::read(&config_path)
             .map_err(|e| HippoError::Config(format!("read config.json: {e}")))?;
-        let qwen_config: Qwen2Config = serde_json::from_slice(&raw)
-            .map_err(|e| HippoError::Config(format!("parse config.json (v0.5 supports Qwen2 family only): {e}")))?;
+        let qwen_config: Qwen2Config = serde_json::from_slice(&raw).map_err(|e| {
+            HippoError::Config(format!(
+                "parse config.json (v0.5 supports Qwen2 family only): {e}"
+            ))
+        })?;
 
         let dtype = match device {
             Device::Cuda(_) => DType::BF16,

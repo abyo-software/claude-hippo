@@ -42,6 +42,24 @@ CREATE TABLE IF NOT EXISTS metadata (
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(
     content_embedding FLOAT[384] distance_metric=cosine
 );
+
+-- v0.5 Phase B: Hebbian co-recall edges.
+-- Stored undirected via canonicalization (from_id < to_id) so each pair
+-- has a single row. Co-recall reinforces weight (+alpha, capped at 1.0)
+-- and refreshes last_reinforced; consolidate decays + prunes.
+-- Competitor mcp-memory-service-rs ignores this table (its schema script
+-- only creates `memories` / `memory_embeddings` / `metadata`), so the
+-- DB file remains drop-in swap-compatible.
+CREATE TABLE IF NOT EXISTS memory_associations (
+    from_id          INTEGER NOT NULL,
+    to_id            INTEGER NOT NULL,
+    weight           REAL NOT NULL,
+    last_reinforced  REAL NOT NULL,
+    PRIMARY KEY (from_id, to_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assoc_from ON memory_associations(from_id);
+CREATE INDEX IF NOT EXISTS idx_assoc_to   ON memory_associations(to_id);
 "#;
 
 const PRAGMAS_SQL: &str = r#"
@@ -458,6 +476,146 @@ impl Storage {
         Ok(n)
     }
 
+    // ---- v0.5 Phase B: Hebbian associations -----------------------------
+
+    /// Reinforce all unordered pairs in `ids` (typical: a recall result set).
+    /// Each edge weight is bumped by `alpha` (capped at 1.0) and its
+    /// `last_reinforced` refreshed. O(N²) in `ids.len()`; callers should
+    /// pass result sets, not full corpora. Returns number of (insert OR
+    /// update) statements issued.
+    ///
+    /// Self-pairs (a == b) and exact duplicates in `ids` are skipped.
+    pub fn reinforce_co_recalled(&mut self, ids: &[i64], alpha: f32) -> Result<usize> {
+        if ids.len() < 2 || alpha <= 0.0 {
+            return Ok(0);
+        }
+        let now = unix_now();
+        let alpha_f64 = alpha as f64;
+        let tx = self.conn.transaction()?;
+        let mut count = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO memory_associations (from_id, to_id, weight, last_reinforced)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(from_id, to_id) DO UPDATE SET
+                    weight = MIN(weight + ?3, 1.0),
+                    last_reinforced = ?4",
+            )?;
+            for i in 0..ids.len() {
+                for j in (i + 1)..ids.len() {
+                    let (lo, hi) = if ids[i] < ids[j] {
+                        (ids[i], ids[j])
+                    } else if ids[i] > ids[j] {
+                        (ids[j], ids[i])
+                    } else {
+                        continue;
+                    };
+                    stmt.execute(params![lo, hi, alpha_f64, now])?;
+                    count += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Neighbors of `seed_id` (alive only), ordered by edge weight DESC then
+    /// freshness DESC. Returns `(neighbor_id, weight, last_reinforced)`.
+    pub fn neighbors_by_id(&self, seed_id: i64, limit: usize) -> Result<Vec<(i64, f32, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                CASE WHEN ma.from_id = ?1 THEN ma.to_id ELSE ma.from_id END AS nbr_id,
+                ma.weight,
+                ma.last_reinforced
+             FROM memory_associations ma
+             JOIN memories m
+                ON m.id = CASE WHEN ma.from_id = ?1 THEN ma.to_id ELSE ma.from_id END
+             WHERE (ma.from_id = ?1 OR ma.to_id = ?1)
+               AND m.deleted_at IS NULL
+             ORDER BY ma.weight DESC, ma.last_reinforced DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![seed_id, limit as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, f32>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Total edge count (alive + dangling — caller decides if dangling
+    /// matters; `prune_associations` clears dangling).
+    pub fn count_associations(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_associations", [], |r| r.get(0))?)
+    }
+
+    /// Decay every edge by `0.5^(age_days / half_life_days)` and drop those
+    /// whose decayed weight falls below `threshold`. Also drops edges
+    /// referencing soft-deleted memories. Returns total edges removed.
+    ///
+    /// `half_life_days <= 0` skips decay (only dangling pruning runs).
+    pub fn prune_associations(
+        &mut self,
+        half_life_days: f32,
+        threshold: f32,
+        now: f64,
+    ) -> Result<i64> {
+        let rows: Vec<(i64, i64, f32, f64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT from_id, to_id, weight, last_reinforced FROM memory_associations",
+            )?;
+            let collected: Vec<(i64, i64, f32, f64)> = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, f32>(2)?,
+                        r.get::<_, f64>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            collected
+        };
+
+        let tx = self.conn.transaction()?;
+        let mut pruned: i64 = 0;
+        {
+            let mut stmt_update = tx.prepare(
+                "UPDATE memory_associations SET weight = ?1 WHERE from_id = ?2 AND to_id = ?3",
+            )?;
+            let mut stmt_delete =
+                tx.prepare("DELETE FROM memory_associations WHERE from_id = ?1 AND to_id = ?2")?;
+            for (from_id, to_id, w, last) in rows {
+                let new_w = if half_life_days > 0.0 {
+                    let age_days = ((now - last).max(0.0) / 86400.0) as f32;
+                    w * 0.5_f32.powf(age_days / half_life_days)
+                } else {
+                    w
+                };
+                if new_w < threshold {
+                    stmt_delete.execute(params![from_id, to_id])?;
+                    pruned += 1;
+                } else if (new_w - w).abs() > f32::EPSILON {
+                    stmt_update.execute(params![new_w as f64, from_id, to_id])?;
+                }
+            }
+        }
+        let dangling = tx.execute(
+            "DELETE FROM memory_associations
+             WHERE from_id IN (SELECT id FROM memories WHERE deleted_at IS NOT NULL)
+                OR to_id   IN (SELECT id FROM memories WHERE deleted_at IS NOT NULL)",
+            [],
+        )? as i64;
+        tx.commit()?;
+        Ok(pruned + dangling)
+    }
+
     /// v0.4: aggregate alive tags with counts. Used by SHODH `GET /api/tags`.
     /// Returns `[(tag, count)]` sorted by count desc then tag asc.
     pub fn list_tags(&self) -> Result<Vec<(String, i64)>> {
@@ -773,5 +931,131 @@ mod tests {
         assert!((s - 0.42).abs() < 1e-6);
         // user_field 保存されている
         assert_eq!(meta["user_field"], serde_json::json!(1));
+    }
+
+    // ---- v0.5 Phase B: Hebbian associations ------------------------------
+
+    /// Helper: insert N memories and return their ids.
+    fn insert_n(s: &mut Storage, n: usize) -> Vec<i64> {
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let r = new_memory_row(format!("mem-{i}"), vec![], None, serde_json::json!({}));
+            let (id, _) = s.insert(&r, Some(&dummy_emb(i as f32 + 1.0))).unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn reinforce_creates_one_edge_per_pair() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 3);
+        let n = s.reinforce_co_recalled(&ids, 0.1).unwrap();
+        // 3 ids → C(3,2) = 3 unordered pairs
+        assert_eq!(n, 3);
+        assert_eq!(s.count_associations().unwrap(), 3);
+        // Re-reinforcing the same set adds no new rows, only updates.
+        let n2 = s.reinforce_co_recalled(&ids, 0.1).unwrap();
+        assert_eq!(n2, 3);
+        assert_eq!(s.count_associations().unwrap(), 3);
+    }
+
+    #[test]
+    fn reinforce_skips_when_alpha_zero_or_single_id() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 2);
+        assert_eq!(s.reinforce_co_recalled(&ids[..1], 0.1).unwrap(), 0);
+        assert_eq!(s.reinforce_co_recalled(&ids, 0.0).unwrap(), 0);
+        assert_eq!(s.count_associations().unwrap(), 0);
+    }
+
+    #[test]
+    fn reinforce_canonicalizes_pair_order() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 2);
+        // Swap order — same edge.
+        s.reinforce_co_recalled(&[ids[0], ids[1]], 0.1).unwrap();
+        s.reinforce_co_recalled(&[ids[1], ids[0]], 0.1).unwrap();
+        assert_eq!(s.count_associations().unwrap(), 1);
+    }
+
+    #[test]
+    fn reinforce_caps_weight_at_one() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 2);
+        for _ in 0..50 {
+            s.reinforce_co_recalled(&ids, 0.5).unwrap();
+        }
+        let nbrs = s.neighbors_by_id(ids[0], 10).unwrap();
+        assert_eq!(nbrs.len(), 1);
+        assert!(nbrs[0].1 <= 1.0 + 1e-6);
+        assert!(
+            nbrs[0].1 >= 0.99,
+            "should saturate near 1.0, got {}",
+            nbrs[0].1
+        );
+    }
+
+    #[test]
+    fn neighbors_orders_by_weight_desc() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 4);
+        // ids[0] strongly with ids[1], weakly with ids[2], not with ids[3]
+        for _ in 0..5 {
+            s.reinforce_co_recalled(&[ids[0], ids[1]], 0.2).unwrap();
+        }
+        s.reinforce_co_recalled(&[ids[0], ids[2]], 0.05).unwrap();
+        let nbrs = s.neighbors_by_id(ids[0], 10).unwrap();
+        let nbr_ids: Vec<i64> = nbrs.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(nbr_ids, vec![ids[1], ids[2]]);
+        assert!(nbrs[0].1 > nbrs[1].1);
+    }
+
+    #[test]
+    fn neighbors_skips_soft_deleted() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 3);
+        s.reinforce_co_recalled(&ids, 0.2).unwrap();
+        let n_before = s.neighbors_by_id(ids[0], 10).unwrap().len();
+        assert_eq!(n_before, 2);
+        s.soft_delete_by_id(ids[1]).unwrap();
+        let n_after = s.neighbors_by_id(ids[0], 10).unwrap().len();
+        assert_eq!(n_after, 1);
+        assert_eq!(s.neighbors_by_id(ids[0], 10).unwrap()[0].0, ids[2]);
+    }
+
+    #[test]
+    fn prune_drops_dangling_edges() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 3);
+        s.reinforce_co_recalled(&ids, 0.5).unwrap();
+        assert_eq!(s.count_associations().unwrap(), 3);
+        // Soft-delete one memory; prune cleans up its 2 incident edges.
+        s.soft_delete_by_id(ids[0]).unwrap();
+        let removed = s.prune_associations(30.0, 0.0, unix_now()).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(s.count_associations().unwrap(), 1);
+    }
+
+    #[test]
+    fn prune_drops_below_threshold() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 2);
+        s.reinforce_co_recalled(&ids, 0.05).unwrap();
+        // Edge weight ≈ 0.05; threshold 0.1 → pruned.
+        let removed = s.prune_associations(0.0, 0.1, unix_now()).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(s.count_associations().unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_decays_with_half_life() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 2);
+        s.reinforce_co_recalled(&ids, 1.0).unwrap();
+        // Pretend "now" is two half-lives in the future → 1.0 * 0.25 = 0.25
+        let now = unix_now() + 60.0 * 86400.0; // +60 days, half_life=30
+        let removed = s.prune_associations(30.0, 0.3, now).unwrap();
+        assert_eq!(removed, 1, "decayed weight 0.25 < threshold 0.3");
     }
 }

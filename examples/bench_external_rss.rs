@@ -135,6 +135,8 @@ async fn main() -> anyhow::Result<()> {
                 limit: 5,
                 no_surprise_boost: false,
                 oversample_factor: None,
+                mode: None,
+                seed_id: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("retrieve err: {:?}", e))?;

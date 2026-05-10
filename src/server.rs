@@ -27,6 +27,15 @@ use tokio::sync::Mutex;
 pub const DEFAULT_HALF_LIFE_DAYS: f32 = 30.0;
 pub const DEFAULT_DECAY_FLOOR: f32 = 0.5;
 pub const DEFAULT_OVERSAMPLE_FACTOR: usize = 6;
+/// v0.5 Phase B: per-co-recall edge increment. Small enough that a single
+/// session of ~10 recalls won't saturate edges to 1.0; large enough that
+/// repeated co-activation across sessions converges visibly. Capped at
+/// 1.0 inside `Storage::reinforce_co_recalled`.
+pub const DEFAULT_CO_RECALL_ALPHA: f32 = 0.1;
+/// v0.5 Phase B: associative recall returns up to this many neighbors of
+/// the seed. Used only when `RecallParams.mode == "associative"` or
+/// `"hybrid"`.
+pub const DEFAULT_ASSOCIATIVE_LIMIT: usize = 20;
 const DEFAULT_RETRIEVE_K: usize = 10;
 const DEFAULT_LIST_N: i64 = 20;
 
@@ -42,6 +51,15 @@ pub struct RankingConfig {
     pub half_life_days: f32,
     pub decay_floor: f32,
     pub default_oversample_factor: usize,
+    /// v0.5 Phase B: enable Hebbian co-recall reinforcement. When `recall`
+    /// returns ≥2 alive results, all unordered pairs in the result get
+    /// their `memory_associations` edge weight bumped by `co_recall_alpha`.
+    /// Default: true. Disable with `--no-hebbian-reinforce` for read-only
+    /// benchmarking or when DB write amplification matters.
+    pub reinforce_co_recall: bool,
+    /// v0.5 Phase B: per-co-recall edge increment. See
+    /// `DEFAULT_CO_RECALL_ALPHA`.
+    pub co_recall_alpha: f32,
 }
 
 impl Default for RankingConfig {
@@ -50,6 +68,8 @@ impl Default for RankingConfig {
             half_life_days: DEFAULT_HALF_LIFE_DAYS,
             decay_floor: DEFAULT_DECAY_FLOOR,
             default_oversample_factor: DEFAULT_OVERSAMPLE_FACTOR,
+            reinforce_co_recall: true,
+            co_recall_alpha: DEFAULT_CO_RECALL_ALPHA,
         }
     }
 }
@@ -159,6 +179,19 @@ pub struct RecallParams {
     /// to `limit / 1` to disable over-fetch entirely. Caps at 1 minimum.
     #[serde(default)]
     pub oversample_factor: Option<usize>,
+    /// v0.5 Phase B: recall mode. `"semantic"` (default) is the v0.4
+    /// behavior. `"associative"` follows Hebbian edges from a seed
+    /// (semantic top-1 if `seed_id` is absent). `"hybrid"` merges semantic
+    /// hits with associative neighbors, deduped, ranked by combined score.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// v0.5 Phase B: explicit seed for `mode == "associative"` or
+    /// `"hybrid"`. When unset, the seed is the top-1 semantic match for
+    /// `query`. Useful for clients that already have an id from a prior
+    /// recall and want to expand the local subgraph without re-running
+    /// semantic search.
+    #[serde(default)]
+    pub seed_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +201,38 @@ pub struct RecalledMemory {
     pub score: f32,
     pub cosine_similarity: f32,
     pub surprise_score: Option<f32>,
+}
+
+/// v0.5 Phase B: recall dispatch mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecallMode {
+    /// Pure semantic search + surprise rerank (v0.4 behavior). Default.
+    #[default]
+    Semantic,
+    /// Hebbian neighbors of a seed memory only.
+    Associative,
+    /// Union of semantic hits + associative neighbors, deduped, ranked by
+    /// blended score.
+    Hybrid,
+}
+
+/// Parse `RecallParams.mode` (`None` defaults to Semantic). Unknown
+/// strings fall back to Semantic with a `warn` trace so clients are not
+/// silently broken; callers that need strict parsing should validate
+/// upstream.
+pub fn parse_recall_mode(s: Option<&str>) -> RecallMode {
+    match s.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("semantic") => RecallMode::Semantic,
+        Some("associative") | Some("assoc") | Some("hebbian") => RecallMode::Associative,
+        Some("hybrid") | Some("mixed") => RecallMode::Hybrid,
+        Some(other) => {
+            tracing::warn!(
+                mode = other,
+                "unknown recall mode, falling back to semantic"
+            );
+            RecallMode::Semantic
+        }
+    }
 }
 
 // ---------- hippo_list_recent / list_memories ----------
@@ -584,6 +649,17 @@ impl MemoryServer {
     /// Typed recall with custom oversample factor. Used by the eval harness
     /// to ensure full corpus coverage before surprise rerank, and by the
     /// `recall` wrapper to apply the per-call `RecallParams.oversample_factor`.
+    ///
+    /// v0.5 Phase B: dispatches on `RecallParams.mode`:
+    /// - `None` / `"semantic"`: v0.4 behavior.
+    /// - `"associative"`: Hebbian neighbors of seed (top-1 semantic match
+    ///   unless `seed_id` is set). `query` is still required for
+    ///   seed-by-query; pass any non-empty placeholder when using
+    ///   `seed_id` directly.
+    /// - `"hybrid"`: union of semantic results and associative neighbors.
+    ///
+    /// When `RankingConfig.reinforce_co_recall` is true and the result
+    /// set has ≥2 alive memories, all unordered pairs are reinforced.
     pub async fn recall_with_options(
         &self,
         p: RecallParams,
@@ -592,51 +668,123 @@ impl MemoryServer {
         if p.query.trim().is_empty() {
             return Err(invalid_input("query is empty"));
         }
+        let mode = parse_recall_mode(p.mode.as_deref());
         let k = p.limit.max(1);
         let factor = opts.oversample_factor.max(1);
-        let query_emb = self.embedder.embed_one(&p.query).map_err(internal_err)?;
-
-        let store = self.storage.lock().await;
-        // KNN over-fetch when surprise boost (rerank では hit が落ちないように)
-        let fetch_k = if p.no_surprise_boost { k } else { k * factor };
-        let hits = store.knn(&query_emb, fetch_k).map_err(internal_err)?;
-
-        let mut results: Vec<RecalledMemory> = Vec::with_capacity(hits.len());
         let now = unix_now();
-        for (id, dist) in hits {
-            let mem = match store.get_by_id(id).map_err(internal_err)? {
-                Some(m) => m,
-                None => continue,
-            };
-            // distance ∈ [0,2] for cosine; sim = 1 - distance/2 ∈ [0,1]
-            let cos_sim = (1.0 - (dist / 2.0)).clamp(0.0, 1.0);
-            let surprise_score = storage::read_surprise(&mem.metadata);
-            let age_days = ((now - mem.created_at).max(0.0) / 86400.0) as f32;
-            let score = if p.no_surprise_boost || surprise_score.is_none() {
-                cos_sim
-            } else {
-                surprise::ranking(
-                    cos_sim,
-                    surprise_score.unwrap_or(0.0),
-                    age_days,
-                    self.ranking.half_life_days,
-                    self.ranking.decay_floor,
-                )
-            };
-            results.push(RecalledMemory {
-                memory: mem,
-                score,
-                cosine_similarity: cos_sim,
-                surprise_score,
-            });
+
+        // 1. Compute semantic hits (always — even associative needs them
+        //    to pick a seed when `seed_id` is unset).
+        let query_emb = self.embedder.embed_one(&p.query).map_err(internal_err)?;
+        let mut store = self.storage.lock().await;
+        let fetch_k = if p.no_surprise_boost { k } else { k * factor };
+        let semantic_hits = store.knn(&query_emb, fetch_k).map_err(internal_err)?;
+
+        let mut results: Vec<RecalledMemory> = Vec::new();
+        let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+        let want_semantic = matches!(mode, RecallMode::Semantic | RecallMode::Hybrid);
+        let want_associative = matches!(mode, RecallMode::Associative | RecallMode::Hybrid);
+
+        if want_semantic {
+            for (id, dist) in &semantic_hits {
+                if !seen_ids.insert(*id) {
+                    continue;
+                }
+                let mem = match store.get_by_id(*id).map_err(internal_err)? {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let cos_sim = (1.0 - (*dist / 2.0)).clamp(0.0, 1.0);
+                let surprise_score = storage::read_surprise(&mem.metadata);
+                let age_days = ((now - mem.created_at).max(0.0) / 86400.0) as f32;
+                let score = if p.no_surprise_boost || surprise_score.is_none() {
+                    cos_sim
+                } else {
+                    surprise::ranking(
+                        cos_sim,
+                        surprise_score.unwrap_or(0.0),
+                        age_days,
+                        self.ranking.half_life_days,
+                        self.ranking.decay_floor,
+                    )
+                };
+                results.push(RecalledMemory {
+                    memory: mem,
+                    score,
+                    cosine_similarity: cos_sim,
+                    surprise_score,
+                });
+            }
         }
-        // 並べ替え (rerank)
+
+        // 2. Associative expansion. Seed = `seed_id` if provided, else the
+        //    top-1 semantic id.
+        if want_associative {
+            let seed = p
+                .seed_id
+                .or_else(|| semantic_hits.first().map(|(id, _)| *id));
+            if let Some(seed_id) = seed {
+                // For pure associative mode, include the seed itself
+                // first (it's literally what the caller asked for).
+                if matches!(mode, RecallMode::Associative) && seen_ids.insert(seed_id) {
+                    if let Some(mem) = store.get_by_id(seed_id).map_err(internal_err)? {
+                        let cos_sim = semantic_hits
+                            .iter()
+                            .find(|(id, _)| *id == seed_id)
+                            .map(|(_, d)| (1.0 - d / 2.0).clamp(0.0, 1.0))
+                            .unwrap_or(1.0);
+                        let surprise_score = storage::read_surprise(&mem.metadata);
+                        results.push(RecalledMemory {
+                            memory: mem,
+                            score: 1.0,
+                            cosine_similarity: cos_sim,
+                            surprise_score,
+                        });
+                    }
+                }
+                let neighbors = store
+                    .neighbors_by_id(seed_id, DEFAULT_ASSOCIATIVE_LIMIT)
+                    .map_err(internal_err)?;
+                for (nbr_id, weight, _last) in neighbors {
+                    if !seen_ids.insert(nbr_id) {
+                        continue;
+                    }
+                    let mem = match store.get_by_id(nbr_id).map_err(internal_err)? {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    let surprise_score = storage::read_surprise(&mem.metadata);
+                    // Associative score = edge weight, clamped. For
+                    // hybrid, this competes with semantic scores in [0,1]
+                    // — edges saturate at 1.0 so the scales are aligned.
+                    let score = weight.clamp(0.0, 1.0);
+                    results.push(RecalledMemory {
+                        memory: mem,
+                        score,
+                        cosine_similarity: 0.0,
+                        surprise_score,
+                    });
+                }
+            }
+        }
+
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results.truncate(k);
+
+        // 3. Hebbian reinforcement on the final set.
+        if self.ranking.reinforce_co_recall && results.len() >= 2 {
+            let ids: Vec<i64> = results.iter().filter_map(|r| r.memory.id).collect();
+            // Best-effort — a reinforcement failure shouldn't break recall.
+            if let Err(e) = store.reinforce_co_recalled(&ids, self.ranking.co_recall_alpha) {
+                tracing::warn!(error = %e, "co-recall reinforcement failed");
+            }
+        }
+
         Ok(results)
     }
 
@@ -942,6 +1090,8 @@ mod tests {
                 limit: 3,
                 no_surprise_boost: false,
                 oversample_factor: None,
+                mode: None,
+                seed_id: None,
             })
             .await
             .unwrap();
@@ -1023,5 +1173,188 @@ mod tests {
             .await
             .unwrap();
         assert!(!r.is_error.unwrap_or(false));
+    }
+
+    // ---- v0.5 Phase B: Hebbian recall tests ------------------------------
+
+    #[test]
+    fn parse_recall_mode_handles_aliases() {
+        assert_eq!(parse_recall_mode(None), RecallMode::Semantic);
+        assert_eq!(parse_recall_mode(Some("")), RecallMode::Semantic);
+        assert_eq!(parse_recall_mode(Some("semantic")), RecallMode::Semantic);
+        assert_eq!(
+            parse_recall_mode(Some("Associative")),
+            RecallMode::Associative
+        );
+        assert_eq!(parse_recall_mode(Some("hebbian")), RecallMode::Associative);
+        assert_eq!(parse_recall_mode(Some("hybrid")), RecallMode::Hybrid);
+        assert_eq!(parse_recall_mode(Some("MIXED")), RecallMode::Hybrid);
+        // Unknown falls back to Semantic.
+        assert_eq!(parse_recall_mode(Some("nonsense")), RecallMode::Semantic);
+    }
+
+    /// Co-recall reinforcement creates one edge per pair in the result set.
+    #[tokio::test]
+    async fn semantic_recall_reinforces_co_recalled_pairs() {
+        let s = make_server();
+        for content in ["alpha note", "alpha story", "alpha tale"] {
+            s.do_remember(RememberParams {
+                content: content.into(),
+                tags: vec![],
+                memory_type: None,
+                importance: Some(0.5),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        }
+        // Pure-cosine recall returns the 3 alpha-similar items.
+        let _ = s
+            .recall(RecallParams {
+                query: "alpha".into(),
+                limit: 3,
+                no_surprise_boost: true,
+                oversample_factor: None,
+                mode: None,
+                seed_id: None,
+            })
+            .await
+            .unwrap();
+        let store = s.storage.lock().await;
+        // 3 results → C(3,2) = 3 edges
+        assert_eq!(store.count_associations().unwrap(), 3);
+    }
+
+    /// `reinforce_co_recall = false` short-circuits the write side.
+    #[tokio::test]
+    async fn disabled_reinforcement_writes_no_edges() {
+        crate::storage::register_sqlite_vec();
+        let store = Storage::open_in_memory().unwrap();
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new());
+        let s = MemoryServer::new_with_config(
+            store,
+            embedder,
+            SurpriseWeights::default(),
+            RankingConfig {
+                reinforce_co_recall: false,
+                ..Default::default()
+            },
+        );
+        for content in ["alpha note", "alpha story"] {
+            s.do_remember(RememberParams {
+                content: content.into(),
+                tags: vec![],
+                memory_type: None,
+                importance: Some(0.5),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        }
+        let _ = s
+            .recall(RecallParams {
+                query: "alpha".into(),
+                limit: 5,
+                no_surprise_boost: true,
+                oversample_factor: None,
+                mode: None,
+                seed_id: None,
+            })
+            .await
+            .unwrap();
+        let store = s.storage.lock().await;
+        assert_eq!(store.count_associations().unwrap(), 0);
+    }
+
+    /// Associative mode returns the seed and its neighbors, ordered by
+    /// edge weight.
+    #[tokio::test]
+    async fn associative_mode_returns_neighbors() {
+        let s = make_server();
+        let mut ids = Vec::new();
+        for content in [
+            "seed alpha",
+            "neighbor1 alpha",
+            "neighbor2 alpha",
+            "outsider beta",
+        ] {
+            let r = s
+                .remember(RememberParams {
+                    content: content.into(),
+                    tags: vec![],
+                    memory_type: None,
+                    importance: Some(0.5),
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+            ids.push(r.id);
+        }
+        // Manually reinforce edges between the first 3 (alpha-cluster).
+        // Skip ids[3] so it should NOT show up in associative recall from
+        // ids[0].
+        {
+            let mut store = s.storage.lock().await;
+            store.reinforce_co_recalled(&ids[..3], 0.5).unwrap();
+        }
+        let r = s
+            .recall(RecallParams {
+                query: "seed alpha".into(),
+                limit: 10,
+                no_surprise_boost: true,
+                oversample_factor: None,
+                mode: Some("associative".into()),
+                seed_id: Some(ids[0]),
+            })
+            .await
+            .unwrap();
+        let returned_ids: Vec<i64> = r.iter().filter_map(|m| m.memory.id).collect();
+        // Seed + 2 neighbors, NOT the outsider.
+        assert!(returned_ids.contains(&ids[0]));
+        assert!(returned_ids.contains(&ids[1]));
+        assert!(returned_ids.contains(&ids[2]));
+        assert!(!returned_ids.contains(&ids[3]));
+    }
+
+    /// Hybrid merges semantic + associative without duplicating any id.
+    #[tokio::test]
+    async fn hybrid_mode_dedupes_results() {
+        let s = make_server();
+        let mut ids = Vec::new();
+        for content in ["alpha one", "alpha two", "beta one"] {
+            let r = s
+                .remember(RememberParams {
+                    content: content.into(),
+                    tags: vec![],
+                    memory_type: None,
+                    importance: Some(0.5),
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+            ids.push(r.id);
+        }
+        // Pre-seed an edge between alpha-one and alpha-two.
+        {
+            let mut store = s.storage.lock().await;
+            store.reinforce_co_recalled(&[ids[0], ids[1]], 0.8).unwrap();
+        }
+        let r = s
+            .recall(RecallParams {
+                query: "alpha".into(),
+                limit: 10,
+                no_surprise_boost: true,
+                oversample_factor: None,
+                mode: Some("hybrid".into()),
+                seed_id: None,
+            })
+            .await
+            .unwrap();
+        let returned_ids: Vec<i64> = r.iter().filter_map(|m| m.memory.id).collect();
+        // No id appears more than once.
+        let mut seen = std::collections::HashSet::new();
+        for id in &returned_ids {
+            assert!(seen.insert(*id), "id {id} appeared twice in hybrid result");
+        }
     }
 }

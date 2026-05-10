@@ -60,6 +60,20 @@ CREATE TABLE IF NOT EXISTS memory_associations (
 
 CREATE INDEX IF NOT EXISTS idx_assoc_from ON memory_associations(from_id);
 CREATE INDEX IF NOT EXISTS idx_assoc_to   ON memory_associations(to_id);
+
+-- v0.5 Phase C: spherical-kmeans cluster centroids.
+-- Recomputed on demand by `consolidate { cluster: true }`. centroid_blob
+-- is the L2-normalized centroid as 384 little-endian f32 (same byte
+-- convention as `memory_embeddings.content_embedding`). `size` is the
+-- number of memories assigned at last recompute. Each clustered memory's
+-- assignment lives in `memories.metadata._hippo.cluster_id`, so the
+-- mapping survives schema reload without a separate join table.
+CREATE TABLE IF NOT EXISTS memory_clusters (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    centroid_blob   BLOB NOT NULL,
+    size            INTEGER NOT NULL DEFAULT 0,
+    last_recomputed REAL NOT NULL
+);
 "#;
 
 const PRAGMAS_SQL: &str = r#"
@@ -115,6 +129,30 @@ pub struct MemoryRow {
 pub enum TagMatch {
     Any,
     All,
+}
+
+/// v0.5 Phase C: outcome of a `recompute_clusters` call.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClusterStats {
+    /// Effective cluster count. `0` when the corpus was too small to
+    /// cluster (`< 4` alive embeddings).
+    pub k: usize,
+    /// Lloyd's iterations actually run (≤ `max_iters`).
+    pub iters: usize,
+    /// Number of memories assigned to a cluster (= alive embeddings).
+    pub assigned: usize,
+    /// Mean cosine distance from each point to its assigned centroid in
+    /// `[0, 2]` (lower = tighter clusters; ≤ 0.05 typically means the
+    /// cluster is dominated by near-duplicate content).
+    pub mean_intra_distance: f32,
+}
+
+/// v0.5 Phase C: cluster summary row.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClusterInfo {
+    pub id: i64,
+    pub size: i64,
+    pub last_recomputed: f64,
 }
 
 impl TagMatch {
@@ -555,6 +593,137 @@ impl Storage {
             .query_row("SELECT COUNT(*) FROM memory_associations", [], |r| r.get(0))?)
     }
 
+    // ---- v0.5 Phase C: semantic clusters --------------------------------
+
+    /// Pull `(id, embedding)` for every alive memory that has an
+    /// embedding row. Used by clustering and eval harnesses that need
+    /// direct vector access without going through KNN.
+    pub fn list_alive_embeddings(&self) -> Result<Vec<(i64, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, e.content_embedding
+             FROM memories m
+             JOIN memory_embeddings e ON e.rowid = m.id
+             WHERE m.deleted_at IS NULL",
+        )?;
+        let rows: Vec<(i64, Vec<f32>)> = stmt
+            .query_map([], |r| {
+                let id: i64 = r.get(0)?;
+                let blob: Vec<u8> = r.get(1)?;
+                let v = blob_to_f32_vec(&blob);
+                Ok((id, v))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Total cluster count.
+    pub fn count_clusters(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_clusters", [], |r| r.get(0))?)
+    }
+
+    /// `(id, size, last_recomputed)` for every cluster, ordered by size DESC.
+    pub fn list_clusters(&self) -> Result<Vec<ClusterInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, size, last_recomputed FROM memory_clusters ORDER BY size DESC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ClusterInfo {
+                    id: r.get(0)?,
+                    size: r.get(1)?,
+                    last_recomputed: r.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Recompute clusters via spherical k-means (Lloyd's iteration on
+    /// L2-normalized embeddings, deterministic stride init for
+    /// reproducibility).
+    ///
+    /// Effective `k = max(2, min(target_k, n))`; if fewer than 4 alive
+    /// embeddings exist this is a no-op returning `k = 0`. The persisted
+    /// state is replaced atomically: all old centroids dropped, new ones
+    /// inserted, every clustered memory's `metadata._hippo.cluster_id`
+    /// rewritten via `json_set` (which auto-creates `_hippo` if absent).
+    pub fn recompute_clusters(
+        &mut self,
+        target_k: usize,
+        max_iters: usize,
+    ) -> Result<ClusterStats> {
+        let points = self.list_alive_embeddings()?;
+        if points.len() < 4 {
+            return Ok(ClusterStats {
+                k: 0,
+                iters: 0,
+                assigned: 0,
+                mean_intra_distance: 0.0,
+            });
+        }
+        let n = points.len();
+        let k = target_k.min(n).max(2);
+        let dim = points[0].1.len();
+        if dim == 0 {
+            return Ok(ClusterStats {
+                k: 0,
+                iters: 0,
+                assigned: 0,
+                mean_intra_distance: 0.0,
+            });
+        }
+        let vecs: Vec<&[f32]> = points.iter().map(|(_, v)| v.as_slice()).collect();
+        let (centroids, assignments, iters, mean_dist) = spherical_kmeans(&vecs, k, max_iters);
+
+        let now = unix_now();
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM memory_clusters", [])?;
+
+        // Sizes per cluster index.
+        let mut sizes = vec![0i64; k];
+        for &a in &assignments {
+            sizes[a] += 1;
+        }
+        // Insert centroids, capture the autoincrement ids in stride order.
+        let mut new_ids: Vec<i64> = Vec::with_capacity(k);
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO memory_clusters (centroid_blob, size, last_recomputed)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for (ci, c) in centroids.iter().enumerate() {
+                let blob = f32_vec_to_blob(c);
+                stmt.execute(params![blob, sizes[ci], now])?;
+                new_ids.push(tx.last_insert_rowid());
+            }
+        }
+
+        // Write each memory's cluster_id to metadata via json_set, which
+        // creates intermediate objects ($._hippo) as needed.
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE memories
+                 SET metadata = json_set(
+                     CASE WHEN IFNULL(metadata,'') = '' THEN '{}' ELSE metadata END,
+                     '$._hippo.cluster_id', ?1)
+                 WHERE id = ?2",
+            )?;
+            for ((mem_id, _emb), assigned) in points.iter().zip(assignments.iter()) {
+                let cluster_db_id = new_ids[*assigned];
+                stmt.execute(params![cluster_db_id, mem_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(ClusterStats {
+            k,
+            iters,
+            assigned: n,
+            mean_intra_distance: mean_dist,
+        })
+    }
+
     /// Decay every edge by `0.5^(age_days / half_life_days)` and drop those
     /// whose decayed weight falls below `threshold`. Also drops edges
     /// referencing soft-deleted memories. Returns total edges removed.
@@ -696,6 +865,92 @@ fn unix_now() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// v0.5 Phase C: spherical k-means (Lloyd's iteration on L2-normalized
+/// vectors). Init via deterministic stride pick — same input → same
+/// output, which matters for tests and for downstream caching.
+///
+/// Returns `(centroids, assignments, iters_run, mean_intra_distance)`.
+fn spherical_kmeans(
+    points: &[&[f32]],
+    k: usize,
+    max_iters: usize,
+) -> (Vec<Vec<f32>>, Vec<usize>, usize, f32) {
+    let n = points.len();
+    let dim = points[0].len();
+    let stride = (n / k).max(1);
+    let mut centroids: Vec<Vec<f32>> = (0..k)
+        .map(|i| points[(i * stride).min(n - 1)].to_vec())
+        .collect();
+    let mut assignments = vec![0usize; n];
+    let mut iters = 0;
+    for _ in 0..max_iters {
+        iters += 1;
+        let mut changed = false;
+        for (idx, p) in points.iter().enumerate() {
+            let mut best_c = 0usize;
+            let mut best_dot = f32::NEG_INFINITY;
+            for (ci, c) in centroids.iter().enumerate() {
+                let dot: f32 = p.iter().zip(c).map(|(a, b)| a * b).sum();
+                if dot > best_dot {
+                    best_dot = dot;
+                    best_c = ci;
+                }
+            }
+            if assignments[idx] != best_c {
+                changed = true;
+                assignments[idx] = best_c;
+            }
+        }
+        if !changed {
+            break;
+        }
+        let mut sums: Vec<Vec<f32>> = vec![vec![0.0; dim]; k];
+        let mut counts = vec![0usize; k];
+        for (idx, p) in points.iter().enumerate() {
+            let c = assignments[idx];
+            for (s, x) in sums[c].iter_mut().zip(p.iter()) {
+                *s += *x;
+            }
+            counts[c] += 1;
+        }
+        for ci in 0..k {
+            if counts[ci] == 0 {
+                continue; // empty cluster: keep prior centroid
+            }
+            let norm: f32 = sums[ci].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+            for s in sums[ci].iter_mut() {
+                *s /= norm;
+            }
+            centroids[ci] = std::mem::take(&mut sums[ci]);
+        }
+    }
+    let mut total = 0.0_f64;
+    for (idx, p) in points.iter().enumerate() {
+        let c = &centroids[assignments[idx]];
+        let dot: f32 = p.iter().zip(c).map(|(a, b)| a * b).sum();
+        total += (1.0 - dot) as f64;
+    }
+    let mean_dist = if n > 0 {
+        (total / n as f64) as f32
+    } else {
+        0.0
+    };
+    (centroids, assignments, iters, mean_dist)
+}
+
+fn f32_vec_to_blob(v: &[f32]) -> Vec<u8> {
+    use zerocopy::AsBytes;
+    v.as_bytes().to_vec()
+}
+
+fn blob_to_f32_vec(blob: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(blob.len() / 4);
+    for chunk in blob.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    out
 }
 
 /// SHA-256 hex (lowercase) — mcp-memory-service-rs と同じ content_hash 規約。
@@ -1057,5 +1312,118 @@ mod tests {
         let now = unix_now() + 60.0 * 86400.0; // +60 days, half_life=30
         let removed = s.prune_associations(30.0, 0.3, now).unwrap();
         assert_eq!(removed, 1, "decayed weight 0.25 < threshold 0.3");
+    }
+
+    // ---- v0.5 Phase C: clustering ---------------------------------------
+
+    /// Build an L2-normalized embedding seeded by two coordinates so we
+    /// can place points at known angular positions for clustering tests.
+    fn two_axis_emb(a: f32, b: f32) -> Vec<f32> {
+        let mut v = vec![0.0_f32; EMBEDDING_DIM];
+        v[0] = a;
+        v[1] = b;
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
+    }
+
+    #[test]
+    fn recompute_skips_when_corpus_too_small() {
+        let mut s = store();
+        let ids = insert_n(&mut s, 3); // < 4 → no-op
+        let stats = s.recompute_clusters(2, 25).unwrap();
+        assert_eq!(stats.k, 0);
+        assert_eq!(s.count_clusters().unwrap(), 0);
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn kmeans_separates_two_axes() {
+        let mut s = store();
+        // Cluster A: (1, 0) ish — 4 points
+        // Cluster B: (0, 1) ish — 4 points
+        let mut a_ids = Vec::new();
+        let mut b_ids = Vec::new();
+        for i in 0..4 {
+            let r = new_memory_row(format!("a-{i}"), vec![], None, serde_json::json!({}));
+            let (id, _) = s
+                .insert(&r, Some(&two_axis_emb(1.0 + i as f32 * 0.01, 0.05)))
+                .unwrap();
+            a_ids.push(id);
+        }
+        for i in 0..4 {
+            let r = new_memory_row(format!("b-{i}"), vec![], None, serde_json::json!({}));
+            let (id, _) = s
+                .insert(&r, Some(&two_axis_emb(0.05, 1.0 + i as f32 * 0.01)))
+                .unwrap();
+            b_ids.push(id);
+        }
+        let stats = s.recompute_clusters(2, 25).unwrap();
+        assert_eq!(stats.k, 2);
+        assert_eq!(stats.assigned, 8);
+        assert!(stats.iters >= 1);
+        assert_eq!(s.count_clusters().unwrap(), 2);
+
+        // Each memory should have a cluster_id; A-side and B-side should
+        // map to different clusters.
+        let mut a_cids = std::collections::HashSet::new();
+        let mut b_cids = std::collections::HashSet::new();
+        for id in &a_ids {
+            let m = s.get_by_id(*id).unwrap().unwrap();
+            let cid = m.metadata["_hippo"]["cluster_id"].as_i64();
+            assert!(cid.is_some(), "A memory {id} missing cluster_id");
+            a_cids.insert(cid.unwrap());
+        }
+        for id in &b_ids {
+            let m = s.get_by_id(*id).unwrap().unwrap();
+            let cid = m.metadata["_hippo"]["cluster_id"].as_i64();
+            assert!(cid.is_some(), "B memory {id} missing cluster_id");
+            b_cids.insert(cid.unwrap());
+        }
+        // All A's in one cluster, all B's in another, and they differ.
+        assert_eq!(a_cids.len(), 1);
+        assert_eq!(b_cids.len(), 1);
+        assert_ne!(a_cids, b_cids);
+    }
+
+    #[test]
+    fn recompute_replaces_prior_clusters() {
+        let mut s = store();
+        for i in 0..6 {
+            let r = new_memory_row(format!("m-{i}"), vec![], None, serde_json::json!({}));
+            s.insert(&r, Some(&dummy_emb(i as f32 + 1.0))).unwrap();
+        }
+        let s1 = s.recompute_clusters(3, 25).unwrap();
+        assert_eq!(s1.k, 3);
+        let s2 = s.recompute_clusters(2, 25).unwrap();
+        assert_eq!(s2.k, 2);
+        // Old k=3 rows should have been swept out before the k=2 rows
+        // were written, so we don't accumulate.
+        assert_eq!(s.count_clusters().unwrap(), 2);
+    }
+
+    #[test]
+    fn recompute_preserves_existing_metadata_keys() {
+        let mut s = store();
+        for i in 0..4 {
+            let r = new_memory_row(
+                format!("m-{i}"),
+                vec![],
+                None,
+                serde_json::json!({"user_field": i}),
+            );
+            s.insert(&r, Some(&dummy_emb(i as f32 + 1.0))).unwrap();
+        }
+        s.recompute_clusters(2, 25).unwrap();
+        // user_field must still be there alongside the new _hippo.cluster_id.
+        for i in 1..=4 {
+            let m = s.get_by_id(i).unwrap().unwrap();
+            assert!(
+                m.metadata["user_field"].is_number(),
+                "user_field overwritten on memory {i}: {}",
+                m.metadata
+            );
+            assert!(m.metadata["_hippo"]["cluster_id"].is_i64());
+        }
     }
 }

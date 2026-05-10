@@ -60,6 +60,7 @@ pub fn router(server: Arc<MemoryServer>) -> Router {
         .route("/api/tags", get(handle_tags))
         .route("/api/stats", get(handle_stats))
         .route("/api/consolidate", post(handle_consolidate))
+        .route("/api/clusters", get(handle_list_clusters))
         .with_state(server)
 }
 
@@ -452,6 +453,18 @@ struct ConsolidateRequest {
     /// memories still runs).
     #[serde(default)]
     edge_prune_threshold: Option<f32>,
+    /// v0.5 Phase C: opt-in spherical-kmeans recompute over alive
+    /// embeddings. Off by default because clustering is O(n·k·iters) and
+    /// most consolidate calls only want decay/archival. When `true`, the
+    /// `cluster_*` fields of `ConsolidateReply` are populated and each
+    /// alive memory's `metadata._hippo.cluster_id` is rewritten.
+    #[serde(default)]
+    cluster: bool,
+    /// v0.5 Phase C: requested cluster count. If unset, the storage
+    /// layer auto-picks `min(target_k, n)` floored at 2 (i.e. omit this
+    /// to let the server choose). Capped at the alive corpus size.
+    #[serde(default)]
+    cluster_target_k: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -470,10 +483,13 @@ struct ConsolidateReply {
     pruned_edges: i64,
     /// v0.5: total alive edges after this call's prune.
     associations_total: i64,
-    /// Honest disclosure: SHODH spec lists association discovery and
-    /// semantic clustering under "consolidate". v0.5 wires association
-    /// discovery (Hebbian edges grown on the read path, decayed/pruned
-    /// here). Semantic clustering is still deferred.
+    /// v0.5 Phase C: clustering stats. `None` when `cluster: false` was
+    /// requested or the corpus was too small (< 4 alive embeddings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cluster_stats: Option<crate::storage::ClusterStats>,
+    /// Honest disclosure remains so callers can see which SHODH spec
+    /// items are deferred. v0.5 Phase C drains this list to empty —
+    /// association discovery and semantic clustering are both wired.
     deferred: Vec<&'static str>,
 }
 
@@ -552,6 +568,24 @@ async fn handle_consolidate(
         .unwrap_or(0);
     let associations_total = store.count_associations().unwrap_or(0);
 
+    // v0.5 Phase C: optional clustering. Skipped by default to keep
+    // consolidate cheap; opt in via `cluster: true`.
+    let cluster_stats = if req.cluster {
+        let target_k = req
+            .cluster_target_k
+            .unwrap_or(default_cluster_k(total_after));
+        match store.recompute_clusters(target_k, DEFAULT_CLUSTER_MAX_ITERS) {
+            Ok(s) if s.k > 0 => Some(s),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "cluster recompute failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     (
         StatusCode::OK,
         Json(ConsolidateReply {
@@ -561,10 +595,43 @@ async fn handle_consolidate(
             dry_run: req.dry_run,
             pruned_edges,
             associations_total,
-            deferred: vec!["semantic_clustering"],
+            cluster_stats,
+            deferred: Vec::new(),
         }),
     )
         .into_response()
+}
+
+/// v0.5 Phase C: heuristic for the auto-`k`. `sqrt(n / 2)` is a
+/// well-known starting point for k-means; capped at 16 so consolidate
+/// stays bounded for big corpora and floored at 2 so the call is
+/// meaningful.
+fn default_cluster_k(alive: i64) -> usize {
+    if alive < 4 {
+        return 0;
+    }
+    let raw = ((alive as f64) / 2.0).sqrt().round() as usize;
+    raw.clamp(2, 16)
+}
+
+const DEFAULT_CLUSTER_MAX_ITERS: usize = 25;
+
+#[derive(Serialize)]
+struct ClustersReply {
+    clusters: Vec<crate::storage::ClusterInfo>,
+    count: usize,
+}
+
+async fn handle_list_clusters(State(server): State<Arc<MemoryServer>>) -> impl IntoResponse {
+    let storage = server.storage_arc();
+    let store = storage.lock().await;
+    match store.list_clusters() {
+        Ok(clusters) => {
+            let count = clusters.len();
+            (StatusCode::OK, Json(ClustersReply { clusters, count })).into_response()
+        }
+        Err(e) => storage_error_to_http(e),
+    }
 }
 
 fn unix_now() -> f64 {
@@ -688,13 +755,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_13_endpoints_route_to_a_handler() {
-        // v0.4 Phase B-2 closed the last 6 SHODH endpoints. None should
-        // return 405 / 404 for the canonical method+path combo. We probe
-        // each with a minimal valid body and just check the routing
-        // dispatched (status != 405 Method Not Allowed and != 404 Not
-        // Found-due-to-missing-route — distinct from 404 returned for a
-        // missing per-id resource, which is fine).
+    async fn all_endpoints_route_to_a_handler() {
+        // v0.4 Phase B-2 closed the last 6 SHODH endpoints; v0.5 Phase C
+        // added `/api/clusters` (out-of-spec but consistent with the
+        // SHODH consolidate semantics). None should return 405 / 501.
         let app = router(test_server());
         let probes = vec![
             ("GET", "/api/health", None),
@@ -710,6 +774,7 @@ mod tests {
             ("GET", "/api/tags", None),
             ("GET", "/api/stats", None),
             ("POST", "/api/consolidate", Some(r#"{}"#)),
+            ("GET", "/api/clusters", None),
         ];
         for (method, path, body) in probes {
             let mut req = Request::builder().method(method).uri(path);
@@ -1136,18 +1201,106 @@ mod tests {
         assert_eq!(v["archived"].as_array().unwrap().len(), 4);
         assert_eq!(v["total_alive_before"], 4);
         assert_eq!(v["total_alive_after"], 0);
-        // v0.5: only semantic_clustering remains deferred — association
-        // discovery is wired (edges grown on read, decayed/pruned here).
+        // v0.5 Phase C: deferred[] is now drained — association discovery
+        // (edges) and semantic clustering are both wired. The field is
+        // still present (caller-visible contract) but empty.
         let deferred: Vec<&str> = v["deferred"]
             .as_array()
             .unwrap()
             .iter()
             .map(|s| s.as_str().unwrap())
             .collect();
-        assert!(!deferred.contains(&"association_discovery"));
-        assert!(deferred.contains(&"semantic_clustering"));
+        assert!(
+            deferred.is_empty(),
+            "deferred[] should be empty, got {deferred:?}"
+        );
         // Edge prune fields must surface even when no edges exist.
         assert_eq!(v["pruned_edges"], 0);
         assert_eq!(v["associations_total"], 0);
+        // Cluster stats absent unless requested.
+        assert!(v.get("cluster_stats").map_or(true, |c| c.is_null()));
+    }
+
+    // ---- v0.5 Phase C: clustering REST surface --------------------------
+
+    #[tokio::test]
+    async fn list_clusters_empty_until_recompute() {
+        let s = test_server();
+        let app = router(s.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/clusters")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["clusters"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn consolidate_with_cluster_flag_writes_centroids() {
+        let s = test_server();
+        // Need ≥4 alive memories with embeddings for clustering to fire.
+        create_low_surprise(&s, 6).await;
+        let app = router(s.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/consolidate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"grace_period_days":0,"archive_threshold":0.0,"cluster":true,"cluster_target_k":2}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Cluster stats must be populated.
+        assert!(
+            v["cluster_stats"].is_object(),
+            "cluster_stats not present in {v}"
+        );
+        assert_eq!(v["cluster_stats"]["k"], 2);
+        assert_eq!(v["cluster_stats"]["assigned"], 6);
+
+        // /api/clusters now returns 2 entries.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/clusters")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["count"], 2);
+        let total_size: i64 = v["clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["size"].as_i64().unwrap())
+            .sum();
+        assert_eq!(total_size, 6);
     }
 }

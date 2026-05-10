@@ -13,6 +13,7 @@ use crate::server::{
 };
 use crate::surprise::SurpriseWeights;
 use crate::{server, storage, HippoError, VERSION};
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -568,15 +569,14 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
-/// Choose between MCP stdio and SHODH REST as the primary transport.
+/// Run MCP stdio and (optionally) SHODH REST in the same process.
 ///
-/// v0.3 design: a single `hippo serve` process exposes ONE transport. To
-/// run both in the same machine, launch two processes — they share the
-/// same SQLite DB file via WAL and SQLite's in-process locking handles
-/// concurrency. Doing in-process dual-serve would require either cloning
-/// the embedder/storage state across two separate `MemoryServer` instances
-/// or refactoring rmcp's owned-`self` `serve()` signature; both are scoped
-/// to v0.4.
+/// v0.4 dual-serve: when `--shodh-rest` is set, build two `MemoryServer`
+/// instances sharing the same `Arc<Mutex<Storage>>` and embedder/prediction-loss
+/// `Arc`s. The MCP one is consumed by `rmcp::ServiceExt::serve` (which takes
+/// owned `self`); the REST one is wrapped in `Arc<MemoryServer>` for axum's
+/// shared State. Both surfaces hit the same SQLite WAL via the shared lock.
+/// The first task to error or exit takes the whole process down.
 #[allow(clippy::too_many_arguments)]
 async fn run_serve_with_optional_rest(
     store: storage::Storage,
@@ -604,20 +604,53 @@ async fn run_serve_with_optional_rest(
         .unwrap_or("127.0.0.1:8765")
         .parse()
         .map_err(|e| anyhow::anyhow!("--shodh-rest-bind invalid socket addr: {e}"))?;
-    let mem_server = Arc::new(server::MemoryServer::new_full_with_memory_tool(
-        store,
+
+    let shared_storage = Arc::new(tokio::sync::Mutex::new(store));
+    let rest_instance = Arc::new(server::MemoryServer::from_shared_storage(
+        shared_storage.clone(),
+        embedder.clone(),
+        pl_backend.clone(),
+        weights,
+        ranking,
+        enable_memory_tool,
+    ));
+    let mcp_instance = server::MemoryServer::from_shared_storage(
+        shared_storage,
         embedder,
         pl_backend,
         weights,
         ranking,
         enable_memory_tool,
-    ));
+    );
+
     tracing::info!(
         ?bind,
-        "claude-hippo serving SHODH REST only (no stdio MCP). Run a second \
-         `hippo serve` process to expose stdio MCP alongside (they share the SQLite DB)."
+        "claude-hippo serving stdio MCP + SHODH REST in the same process \
+         (shared SQLite via Arc<Mutex<Storage>>)"
     );
-    crate::shodh_rest::serve(mem_server, bind).await
+
+    let rest_handle = tokio::spawn(crate::shodh_rest::serve(rest_instance, bind));
+    let mcp_handle = tokio::spawn(async move {
+        use rmcp::ServiceExt;
+        let svc = mcp_instance
+            .serve(rmcp::transport::io::stdio())
+            .await
+            .map_err(|e| anyhow::anyhow!("rmcp serve init failed: {e}"))?;
+        svc.waiting().await.ok();
+        Ok::<(), anyhow::Error>(())
+    });
+
+    tokio::select! {
+        r = rest_handle => match r {
+            Ok(inner) => inner.context("SHODH REST exited")?,
+            Err(e) => anyhow::bail!("SHODH REST task join: {e}"),
+        },
+        r = mcp_handle => match r {
+            Ok(inner) => inner.context("MCP stdio exited")?,
+            Err(e) => anyhow::bail!("MCP stdio task join: {e}"),
+        },
+    }
+    Ok(())
 }
 
 async fn run_self_bench(

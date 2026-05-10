@@ -281,9 +281,32 @@ impl MemoryServer {
         ranking: RankingConfig,
         enable_memory_tool: bool,
     ) -> Self {
+        Self::from_shared_storage(
+            Arc::new(Mutex::new(storage)),
+            embedder,
+            prediction_loss,
+            weights,
+            ranking,
+            enable_memory_tool,
+        )
+    }
+
+    /// v0.4: build a `MemoryServer` from an already-shared `Arc<Mutex<Storage>>`.
+    /// Lets two server instances (e.g. one for stdio MCP and one for SHODH
+    /// REST) share the same SQLite connection and `sqlite-vec` virtual table
+    /// in the same process, removing the v0.3 caveat that `--shodh-rest`
+    /// disabled stdio MCP.
+    pub fn from_shared_storage(
+        storage: Arc<Mutex<Storage>>,
+        embedder: Arc<dyn Embedder>,
+        prediction_loss: Option<Arc<dyn PredictionLossBackend>>,
+        weights: SurpriseWeights,
+        ranking: RankingConfig,
+        enable_memory_tool: bool,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            storage: Arc::new(Mutex::new(storage)),
+            storage,
             embedder,
             prediction_loss,
             enable_memory_tool,

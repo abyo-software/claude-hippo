@@ -1,89 +1,64 @@
 # claude-hippo 🦛
 
-> Claude Code に **海馬（hippocampus）** を足す MCP server。
-> 全部覚える代わりに、**特異性が高い瞬間だけ** を長期記憶化する surprise-aware memory store。
+> A **hippocampus for Claude Code** — an MCP server that doesn't try to remember everything, but learns which moments are *worth* remembering.
 
 [![crates.io](https://img.shields.io/crates/v/claude-hippo.svg)](https://crates.io/crates/claude-hippo)
 [![Downloads](https://img.shields.io/crates/d/claude-hippo.svg)](https://crates.io/crates/claude-hippo)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue)](#license)
+[![CI](https://github.com/abyo-software/claude-hippo/actions/workflows/ci.yml/badge.svg)](https://github.com/abyo-software/claude-hippo/actions/workflows/ci.yml)
+
+🇬🇧 English: **this page** | 🇯🇵 日本語: [README.ja.md](README.ja.md)
 
 ```bash
 cargo install claude-hippo
 hippo serve  # MCP stdio server, ready for Claude Code
 ```
 
-**v0.5 highlights** (released 2026-05-10):
-- `--features candle` で **candle-rs native prediction-loss** が main lib に統合 (v0.4 D-spike を本番化、CPU `candle` / GPU `candle-cuda` 両 flag、Qwen2.5-0.5B 既定)
-- **Hebbian associations**: `memory_associations` 別テーブル + 自動 co-recall reinforcement + `recall mode=associative/hybrid` + consolidate edge prune (SHODH `associative recall` 仕様準拠)
-- **Semantic clustering**: spherical k-means + `memory_clusters` テーブル + `GET /api/clusters` + consolidate `cluster: true` flag (SHODH consolidate の deferred 全項目 wire 完了)
-- Real-backend bench variants (`tests/eval_*_real_*.rs`): FastEmbedder ONNX + CandleLocalPredictionLoss CPU で v0.2-v0.4 fixture を再走 (`#[ignore]` opt-in、release smoke 用)
-
 ---
 
-## なぜ「もう一つの memory MCP」が必要か
+## Why claude-hippo
 
-[mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) (Python)、その Rust port [mcp-memory-service-rs](https://github.com/doobidoo/mcp-memory-service-rs)、その他複数の memory MCP が既にある。claude-hippo は次の 4 軸で差別化する：
+Most memory MCP servers store every message and rely on cosine similarity at recall time. That works until your sessions get long — at which point the *important decision* you made last month is buried under 500 routine chat messages with similar wording.
 
-| 軸 | claude-hippo | 既存 |
+claude-hippo borrows the **surprise-driven consolidation** mechanism from neuroscience: only memories that were *surprising* at encoding time get a long-term ranking boost, and that boost decays gracefully so old-but-pivotal items stay competitive against fresh-but-mundane ones.
+
+| Differentiator | claude-hippo | Typical memory MCP |
 |---|---|---|
-| **Surprise-based selection** | embedding outlier + engagement + explicit signal を合成して `surprise_score` を毎回計算、recall でこれを使った時間減衰込み ranking。「あの時の重要な決定」が長期セッションで薄まらない | ❌ ない |
-| **Pure Rust 軽量** | 起動 4.5 ms (lazy embedding load)、warm RSS 150 MB、store p50 3.1 ms、retrieve p50 2.7 ms | mcp-memory-service-rs: cold 117 ms / RSS 186 MB / store 5.9 ms / retrieve 6.7 ms |
-| **SHODH spec 互換** | mcp-memory-service-rs と完全同一 SQLite schema → **同じ DB ファイルを両者で読み書き可能**。乗り換え無痛 | ✅ mcp-memory-service-rs 系のみ |
-| **Apache-2.0 / MIT dual ライセンス** | 商用利用フリー | mcp-memory-service-rs は PolyForm Noncommercial（商用は別契約必要） |
+| **Surprise-based selection** | `surprise = embedding_outlier·0.4 + engagement·0.2 + explicit·0.1 + prediction_loss·0.3`, blended into recall ranking with exponential decay (`half_life=30d`, `decay_floor=0.5`) | Pure cosine similarity |
+| **Pure-Rust, lightweight** | cold-start 4.5 ms (lazy embedding load), warm RSS 150 MB, store p50 3.1 ms, retrieve p50 2.7 ms | mcp-memory-service-rs: cold 117 ms / RSS 186 MB |
+| **Drop-in DB compat** | Identical SQLite schema to [`mcp-memory-service-rs`](https://github.com/doobidoo/mcp-memory-service-rs) — the same `.db` file works in either binary | Locked into one implementation |
+| **Apache-2.0 / MIT** | Commercial use unrestricted | Often PolyForm Noncommercial or AGPL |
 
-詳細は [PLAN.md](PLAN.md) §3。
-
----
-
-## ベンチ（Linux x86_64、`scripts/bench_competitor.py --n 100`）
-
-```
-| Metric            | mcp-memory-service-rs          | claude-hippo                   |
-|-------------------|--------------------------------|--------------------------------|
-| cold-start (ms)   |                          117.3 |                            4.5 |
-| store p50 (ms)    |                            5.9 |                            3.1 |
-| store p95 (ms)    |                            8.1 |                            4.5 |
-| retrieve p50 (ms) |                            6.7 |                            2.7 |
-| retrieve p95 (ms) |                            8.5 |                            3.5 |
-| RSS (MB)          |                          186.3 |                          150.5 |
-```
-
-cold-start の 26× 差は claude-hippo が embedding model を **lazy load**（最初の `store_memory` で初めて load する）するため。RSS 19% 減は ranking layer の Arc/Mutex 削減と、KNN over-sample を tombstone がある時だけに限定する最適化（mcp-memory-service-rs と同じ）の純化。
-
-> 自分で再計測：`python3 scripts/bench_competitor.py --n 100`
+Full positioning: [PLAN.md §3](PLAN.md).
 
 ---
 
-## SHODH DB swap conformance
+## v0.5 highlights (released 2026-05-10)
 
-**証明：** claude-hippo と mcp-memory-service-rs は同じ SQLite ファイルを安全に共有できる。
+- **`--features candle`**: native pure-Rust LLM prediction-loss via [candle-rs](https://github.com/huggingface/candle). CPU (`candle`) and GPU (`candle-cuda`) flags. Default install stays lean (~25 MB binary, no candle compile).
+- **Hebbian associations**: a separate `memory_associations` table grows co-recall edges automatically; `recall mode=associative|hybrid` follows them; `consolidate` decays/prunes them. Implements the SHODH spec's `associative recall`.
+- **Semantic clustering**: spherical k-means over alive embeddings, persisted in `memory_clusters`; `GET /api/clusters` exposes the structure; `consolidate { cluster: true }` rewrites cluster assignments. Implements the SHODH spec's `semantic clustering and compression`.
+- **Real-backend bench variants**: `tests/eval_real_local.rs` (FastEmbedder ONNX) and `tests/eval_d_real_candle.rs` (Qwen2.5-0.5B CPU). Gated `#[ignore]` so CI stays fast; release smoke runs them.
+- **SHODH OpenAPI v1.0.0**: all 14 endpoints (13 spec + `GET /api/clusters`) wired, `consolidate.deferred[]` is now empty.
 
-`python3 scripts/conformance_swap.py` を走らせると：
-
-```
-Phase 1: claude-hippo writes 5 memories
-Phase 2: mcp-memory-service-rs reads same DB        → 5/5 visible ✓
-Phase 3: mcp-memory-service-rs writes 5 more
-Phase 4: claude-hippo reads all 10                  → 10/10 visible ✓
-Phase 5: claude-hippo semantic recall over mms-written content (cos=0.83) ✓
-PASS: SHODH DB swap conformance verified ✓
-```
-
-**何を意味するか**：
-- 既存の `mcp-memory-service` / `mcp-memory-service-rs` ユーザは binary を入れ替えるだけで claude-hippo に乗り換え可（過去の記憶を全部引き継ぐ）。
-- 逆に PolyForm が必要な人は claude-hippo で書いた DB を `mcp-memory-service-rs` で読める。
-
-vector space も `all-MiniLM-L6-v2` を双方使うので一致確認済（手動検証で `[-0.0217, 0.0828, 0.0426, -0.0150, -0.0737]` が両者で一致）。
+See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ---
 
-## Claude Code から使う
+## Install & wire it into Claude Code
 
 ```bash
+# Default install (lean, MCP stdio + SHODH REST)
 cargo install claude-hippo
+
+# With candle-rs native prediction-loss (CPU)
+cargo install claude-hippo --features candle
+
+# With CUDA acceleration (requires cuDNN system install)
+cargo install claude-hippo --features candle-cuda
 ```
 
-Claude Code の `~/.claude/mcp_servers.json`（または `claude mcp add` 経由）に：
+In `~/.claude/mcp_servers.json` (or via `claude mcp add`):
 
 ```jsonc
 {
@@ -96,7 +71,7 @@ Claude Code の `~/.claude/mcp_servers.json`（または `claude mcp add` 経由
 }
 ```
 
-`hippo serve` はデフォルトで `~/.local/share/claude-hippo/memory.db` に保存。`HIPPO_DB_PATH` env で変更可。詳細は [docs/CLAUDE_CODE_SETUP.md](docs/CLAUDE_CODE_SETUP.md)。
+By default, the SQLite database lives at `~/.local/share/claude-hippo/memory.db` (override with `HIPPO_DB_PATH`). Full client setup details: [docs/CLAUDE_CODE_SETUP.md](docs/CLAUDE_CODE_SETUP.md). Cursor / Continue / Aider snippets: [docs/CLIENT_COMPAT.md](docs/CLIENT_COMPAT.md).
 
 ---
 
@@ -104,179 +79,196 @@ Claude Code の `~/.claude/mcp_servers.json`（または `claude mcp add` 経由
 
 ### claude-hippo native (5)
 
-| Tool | 用途 |
+| Tool | Purpose |
 |---|---|
-| `hippo_remember(content, tags?, memory_type?, importance?, metadata?)` | 記憶保存 + surprise score 算出 |
-| `hippo_recall(query, limit=10, no_surprise_boost=false)` | semantic search + surprise-weighted ranking |
-| `hippo_list_recent(n=20)` | 直近 N 件 |
-| `hippo_forget(content_hash?, id?, dry_run=false)` | soft-delete |
-| `hippo_session_summary(hours=24)` | 直近活動の by_type / top_tags / highlights / mean surprise |
+| `hippo_remember(content, tags?, memory_type?, importance?, metadata?)` | Store memory + compute surprise score |
+| `hippo_recall(query, limit=10, mode=?, seed_id=?, no_surprise_boost=false)` | Semantic / associative / hybrid recall with surprise-weighted ranking |
+| `hippo_list_recent(n=20)` | Most recent N (alive only) |
+| `hippo_forget(content_hash?, id?, dry_run=false)` | Soft-delete |
+| `hippo_session_summary(hours=24)` | Activity rollup: by_type / top_tags / highlights / mean surprise |
 
-### SHODH alias (4) — 既存クライアント設定無変更で乗り換え可
+### SHODH-spec aliases (4)
 
-`store_memory` / `retrieve_memory` / `list_memories` / `delete_memory` は対応する hippo_* に転送する。`mcp-memory-service-rs` と同 wire format。
+`store_memory` / `retrieve_memory` / `list_memories` / `delete_memory` forward to the corresponding `hippo_*`. Existing SHODH clients can swap binaries without config changes.
 
-### `ping` — health probe（auth 不要）
+### REST surface (`--shodh-rest`)
+
+All 14 SHODH OpenAPI v1.0.0 endpoints + `GET /api/clusters`. Coexists with MCP stdio in the same process.
 
 ---
 
-## Surprise scoring とは
+## Surprise scoring, plain English
 
-```rust
-surprise = 0.4 * embedding_outlier   // 既存記憶ベクトル群からの cosine 距離
-         + 0.2 * engagement          // content 長 + tag 数の飽和関数
-         + 0.1 * explicit            // ユーザの importance flag
-         + 0.3 * prediction_loss     // (将来) abyo-llm-probe で LLM の驚き
+Every memory gets a score at write time:
+
+```
+surprise = 0.4 · embedding_outlier   // cosine distance from existing memories
+         + 0.2 · engagement          // saturating function of length + tag count
+         + 0.1 · explicit            // user-marked importance
+         + 0.3 · prediction_loss     // LLM NLL (with `--features candle`) or external HTTP backend
 ```
 
-`prediction_loss` が None（v0.1）の時は重みを `embedding_outlier` と `engagement` に按分。
+Recall then ranks by:
 
-recall ranking はこれと cosine sim と時間減衰の合成：
-
-```rust
-score = 0.7 * cos_sim
-      + 0.3 * surprise * exp(-age_days * ln(2) / 30 days)
+```
+score = 0.7 · cosine_similarity
+      + 0.3 · surprise · max(exp(-age_days · ln(2) / half_life), decay_floor)
 ```
 
-つまり **古くても surprise が高ければ浮かぶ、新しくても陳腐ならランクが下がる**。`no_surprise_boost=true` で純粋な vector similarity に戻せる。
-
-理論本体は [docs/SURPRISE_SELECTION.md](docs/SURPRISE_SELECTION.md)。
+Net effect: **old-but-surprising stays visible, new-but-mundane sinks**. `no_surprise_boost=true` falls back to pure cosine. Theory and evaluation: [docs/SURPRISE_SELECTION.md](docs/SURPRISE_SELECTION.md).
 
 ---
 
 ## CLI
 
 ```bash
-hippo serve [--db PATH] [--model-cache DIR] \
+hippo serve [--db PATH] [--shodh-rest] [--shodh-rest-bind 127.0.0.1:8765] \
+            [--prediction-loss-backend {none|openai-compat|candle-local}] \
+            [--candle-model-id Qwen/Qwen2.5-0.5B] [--candle-cpu] \
+            [--no-hebbian-reinforce] [--co-recall-alpha 0.1] \
             [--surprise-weights "0.4,0.2,0.1,0.3"] \
-            [--embedding-model {minilm-l6-v2|bge-small-en-v15-q}]   # MCP stdio (default)
-hippo verify [--db PATH]                       # schema apply + sqlite-vec 確認
-hippo embed "text" [--embedding-model X]       # 埋め込み単発、smoke test
-hippo bench --n 100 [--surprise-weights X] [--embedding-model X]    # 自前 self-bench
+            [--half-life-days 30] [--decay-floor 0.5] [--oversample-factor 6]
+hippo verify [--db PATH]
+hippo embed "text" [--embedding-model {minilm-l6-v2|bge-small-en-v15-q}]
+hippo bench --n 100 [...same flags as serve...]
 ```
 
-env：
-- `HIPPO_DB_PATH` — SQLite path（default `~/.local/share/claude-hippo/memory.db`）
-- `HIPPO_MODEL_CACHE` — embedding model dir（default `~/.cache/claude-hippo/models/`）
-- `HIPPO_SURPRISE_WEIGHTS` — `"w_outlier,w_engagement,w_explicit,w_prediction"`、合計 1.0 (±1e-3)。default `"0.4,0.2,0.1,0.3"`
-- `HIPPO_EMBEDDING_MODEL` — `minilm-l6-v2` (default、SHODH DB swap 互換) or `bge-small-en-v15-q` (量子化、384 dim 維持)
-- `RUST_LOG` — `tracing-subscriber` フィルタ
+Environment variables mirror every `--flag` (`HIPPO_DB_PATH`, `HIPPO_SHODH_REST`, `HIPPO_CANDLE_CPU`, `HIPPO_CO_RECALL_ALPHA`, etc.). `RUST_LOG=hippo=debug` for verbose tracing.
 
 ---
 
-## ストレージレイアウト
+## Storage layout
 
 ```sql
--- mcp-memory-service-rs と verbatim 一致
+-- Verbatim-compatible with mcp-memory-service-rs
 CREATE TABLE memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_hash TEXT UNIQUE NOT NULL,  -- SHA-256(content)
+    content_hash TEXT UNIQUE NOT NULL,   -- SHA-256
     content TEXT NOT NULL,
-    tags TEXT,                          -- "a,b,c" comma-joined, 空白保持
-    memory_type TEXT,                   -- "Decision" / "Discovery" / etc (SHODH MemoryType)
-    metadata TEXT,                      -- JSON; claude-hippo は _hippo namespace を予約
-    created_at REAL,
-    updated_at REAL,
-    created_at_iso TEXT,
-    updated_at_iso TEXT,
-    deleted_at REAL DEFAULT NULL        -- soft-delete tombstone
+    tags TEXT,                           -- comma-joined
+    memory_type TEXT,                    -- "Decision" / "Discovery" / etc
+    metadata TEXT,                       -- JSON; claude-hippo reserves _hippo namespace
+    created_at REAL, updated_at REAL,
+    created_at_iso TEXT, updated_at_iso TEXT,
+    deleted_at REAL DEFAULT NULL         -- soft-delete tombstone
 );
 CREATE VIRTUAL TABLE memory_embeddings USING vec0(content_embedding FLOAT[384] distance_metric=cosine);
+
+-- v0.5 additions (ignored by mcp-memory-service-rs, drop-in swap preserved)
+CREATE TABLE memory_associations (from_id, to_id, weight, last_reinforced, PRIMARY KEY (from_id, to_id));
+CREATE TABLE memory_clusters     (id INTEGER PRIMARY KEY AUTOINCREMENT, centroid_blob BLOB, size, last_recomputed);
 ```
 
-`metadata` 中の `_hippo.surprise.{score, components, version}` が claude-hippo の差別化情報。mcp-memory-service-rs はこれを未知 key として無害に無視する。詳細：[docs/SHODH_COMPAT.md](docs/SHODH_COMPAT.md)。
+The `metadata._hippo.{surprise, cluster_id}` namespace is what claude-hippo writes; mcp-memory-service-rs treats it as an unknown key and ignores it harmlessly. Full DB-swap rationale: [docs/SHODH_COMPAT.md](docs/SHODH_COMPAT.md).
 
 ---
 
-## アーキテクチャ
+## Benchmarks
+
+Head-to-head on Linux x86_64 (`scripts/bench_competitor.py --n 100`):
+
+| Metric | mcp-memory-service-rs | claude-hippo |
+|---|---:|---:|
+| cold-start (ms) | 117.3 | **4.5** |
+| store p50 (ms) | 5.9 | **3.1** |
+| store p95 (ms) | 8.1 | **4.5** |
+| retrieve p50 (ms) | 6.7 | **2.7** |
+| retrieve p95 (ms) | 8.5 | **3.5** |
+| RSS (MB) | 186.3 | **150.5** |
+
+Cold-start improvement comes from **lazy embedding load**; the first `store_memory` pays the model load, subsequent operations are warm.
+
+### Surprise-rerank evaluation (mock fixture, deterministic)
+
+| Bench | Headline | Detail |
+|---|---|---|
+| A — Long-session noise | precision@1: **0.08 → 1.00** (default oversample=6) | 100 items / 25 paraphrased queries |
+| B — Cross-session decay | 365-day decision: **negative lift → +0.875 lift** with `decay_floor=0.5` | 50 items × 4 ages |
+| C — Decision trace | recall@5: **0.44 → 1.00** with `--surprise-weights "0.2,0.1,0.5,0.2"` | 4 Decisions among 20 mixed |
+| D — Prediction-loss wiring | 100/100 coverage with mock backend; real candle-local gated `#[ignore]` | Qwen2.5-0.5B CPU |
+
+Real-backend variants (Bench A/B/C with FastEmbedder ONNX, Bench D with candle CPU) are gated `#[ignore]` so the default `cargo test` stays fast — run them at release time. Full disclosure of mock-vs-real tradeoffs: [docs/SURPRISE_SELECTION.md](docs/SURPRISE_SELECTION.md).
+
+### SHODH DB-swap conformance
+
+```
+$ python3 scripts/conformance_swap.py
+Phase 1: claude-hippo writes 5 memories
+Phase 2: mcp-memory-service-rs reads same DB        → 5/5 visible ✓
+Phase 3: mcp-memory-service-rs writes 5 more
+Phase 4: claude-hippo reads all 10                  → 10/10 visible ✓
+Phase 5: claude-hippo semantic recall over mms-written content (cos=0.83) ✓
+PASS: SHODH DB swap conformance verified ✓
+```
+
+---
+
+## Architecture
 
 ```text
-┌────────────┐     stdio JSON-RPC     ┌─────────────────────┐
-│ Claude Code│  ◀───────────────────▶ │ hippo serve         │
-│ (MCP host) │                        │  ┌───────────────┐  │
-└────────────┘                        │  │ rmcp router   │  │  ← MCP SDK
-                                      │  └───────┬───────┘  │
-                                      │  ┌───────▼───────┐  │
-                                      │  │ MemoryServer  │  │  ← src/server.rs
-                                      │  │ (5 hippo_*    │  │
-                                      │  │  tools +      │  │
-                                      │  │  SHODH alias) │  │
-                                      │  └───────┬───────┘  │
-                                      │   ┌──────┴──────┐    │
-                                      │   ▼             ▼    │
-                                      │ surprise    embeddings│
-                                      │ scoring     (fastembed│
-                                      │ + decay     /MiniLM   │
-                                      │             ONNX)     │
-                                      │   │             │    │
-                                      │   ▼             ▼    │
-                                      │  ┌────────────────┐  │
-                                      │  │ Storage        │  │  ← src/storage.rs
-                                      │  │ rusqlite +     │  │
-                                      │  │ sqlite-vec     │  │
-                                      │  │ (SHODH schema) │  │
-                                      │  └────────────────┘  │
-                                      │      │ │             │
-                                      │      ▼ ▼             │
-                                      │  memory.db (.wal)    │
-                                      └──────────────────────┘
+┌────────────┐    stdio JSON-RPC    ┌──────────────────────────────┐
+│ Claude Code│ ◀──────────────────▶ │ hippo serve                  │
+│ (MCP host) │                      │  ┌────────────────────────┐  │
+└────────────┘                      │  │ rmcp router            │  │  ← MCP SDK
+                                    │  └───────────┬────────────┘  │
+                                    │              ▼               │
+                                    │  ┌────────────────────────┐  │
+                                    │  │ MemoryServer           │  │  ← src/server.rs
+                                    │  │ (5 native + 4 SHODH    │  │
+                                    │  │  aliases + ping)       │  │
+                                    │  └──┬──────┬──────────┬───┘  │
+                                    │     ▼      ▼          ▼      │
+                                    │ surprise  embeddings  prediction-loss
+                                    │ scoring   (fastembed  (external HTTP
+                                    │ + decay   /MiniLM)    or candle-rs)
+                                    │     │      │          │      │
+                                    │     ▼      ▼          ▼      │
+                                    │  ┌────────────────────────┐  │
+                                    │  │ Storage (rusqlite +    │  │  ← src/storage.rs
+                                    │  │ sqlite-vec)            │  │
+                                    │  │  - memories            │  │
+                                    │  │  - memory_embeddings   │  │
+                                    │  │  - memory_associations │  │ ← v0.5
+                                    │  │  - memory_clusters     │  │ ← v0.5
+                                    │  └────────────────────────┘  │
+                                    │            │                 │
+                                    │            ▼                 │
+                                    │      memory.db (.wal)        │
+                                    │                              │
+                                    │  Optional: SHODH REST :8765  │
+                                    │  (14 endpoints, --shodh-rest)│
+                                    └──────────────────────────────┘
 ```
 
-詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+Full design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
-## ステータス
+## Status & roadmap
 
-**v0.2** (2026-05-10 release): production-ready as a drop-in for `mcp-memory-service-rs` with surprise scoring + **独自評価ベンチ Bench A/B/C 実数値あり**。
+**v0.5.0** is production-ready as a drop-in for `mcp-memory-service-rs`, with all SHODH OpenAPI v1.0.0 spec items wired (`consolidate.deferred[]` is empty). 129 tests pass + 5 ignored real-backend gates; clippy + fmt clean.
 
-| Bench | 効果 | 詳細 |
-|---|---|---|
-| A: Long-session noise | precision@1 を **8% → 72%** (既定) / **100%** (full oversample) | 100 items, 25 paraphrased queries |
-| B: Cross-session retrieval (forgetting curve) | 30 日決定は perfect、365 日で **負の lift** (honestly 公開) | 50 items × 4 ages |
-| C: Decision trace | recall@5 を **0.44 → 0.97** (既定 weights) / **1.00** (`--surprise-weights "0.2,0.1,0.5,0.2"`) | 4 Decisions in 20 mixed |
+**Planned for v0.6**:
+- candle Phi-3 / Llama-3 family support + all-position-logits patch (faster scoring on long content)
+- 2-hop associative recall (subgraph traversal)
+- Cluster-aware archival (auto-archive redundant items in dense clusters)
+- candle-cuda real-GPU latency measurements
+- abyo-llm-probe Stage 2 verdict (large-model NLL gradients on Vast.ai 4090)
 
-40 unit + 3 integration + 3 eval = **46 tests** all pass. DB swap conformance も pass。詳細は [docs/SURPRISE_SELECTION.md](docs/SURPRISE_SELECTION.md)。
-
-将来：
-- v0.3: abyo-llm-probe 統合（`prediction_loss` を埋める）+ abyo-filters 内蔵 + External embedding API backend (`docs/EXTERNAL_EMBEDDING.md` 設計済) + decay floor / `--half-life-days` CLI（Bench B 365 日 demotion 対処）+ Anthropic Memory Tool 互換レイヤ + 多 MCP client（Cursor / Continue / Aider）対応
-- v1.x: SaaS マネタイズ層（Cloudflare 同期 etc）
-
-開発計画は [PLAN.md](PLAN.md)、変更履歴は [CHANGELOG.md](CHANGELOG.md)。
+Plan: [PLAN.md](PLAN.md). Honest disclosures (what's still deferred and why): [CHANGELOG.md](CHANGELOG.md) §Honest disclosures.
 
 ---
 
-## ベンチを再現する
+## Contributing
 
-前提：`~/git/mcp-memory-service-rs` に competitor を clone + `cargo build --release`。
-HF mirror から ONNX model を `~/.cache/mcp_memory/onnx_models/all-MiniLM-L6-v2/onnx/` に配置。
+Issues and pull requests welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, coding conventions, and how to run the bench harness. Security reports: [SECURITY.md](SECURITY.md). Community standards: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ```bash
-# self-bench
-cargo build --release
-target/release/hippo bench --n 100
-
-# vs competitor (head-to-head, MCP stdio)
-python3 scripts/bench_competitor.py --n 100
-
-# SHODH DB swap conformance
-python3 scripts/conformance_swap.py
-```
-
----
-
-## 開発
-
-```bash
-cargo test --lib                # unit (40)
-cargo test --release            # + integration (3) + eval (3) — eval は MockEmbedder で ONNX 不要
-cargo test --release --test eval_a_long_session    # Bench A 単発
-cargo test --release --test eval_b_cross_session   # Bench B 単発
-cargo test --release --test eval_c_decision_trace  # Bench C 単発
-ls target/eval_results/          # bench_*.json が生成される
-cargo clippy --all-targets -- -D warnings
+cargo test                                       # 129 pass + 3 ignored (default)
+cargo test --features candle                     # 132 pass + 5 ignored
+cargo clippy --features candle --all-targets -- -D warnings
 cargo fmt --check
-cargo audit                      # cargo install --locked cargo-audit が必要
+cargo audit
 ```
 
 ---
@@ -285,18 +277,19 @@ cargo audit                      # cargo install --locked cargo-audit が必要
 
 Dual-licensed under either of:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
-at your option. Commercial use is unrestricted under either license.
+at your option. Commercial use is unrestricted under either license. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project shall be dual-licensed as above, without any additional terms or conditions.
 
 ---
 
-## クレジット
+## Credits
 
-- 互換 schema は [doobidoo/mcp-memory-service-rs](https://github.com/doobidoo/mcp-memory-service-rs) と [doobidoo/mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) から拝借（Apache-2.0、PolyForm Noncommercial）
-- SHODH spec は [varun29ankuS/shodh-memory](https://github.com/varun29ankuS/shodh-memory)
-- MCP は [Anthropic Model Context Protocol](https://modelcontextprotocol.io)
-- 埋め込みは [Anush008/fastembed-rs](https://github.com/Anush008/fastembed-rs) + [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+- The compatible SQLite schema is borrowed from [doobidoo/mcp-memory-service-rs](https://github.com/doobidoo/mcp-memory-service-rs) and [doobidoo/mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) (Apache-2.0 / PolyForm Noncommercial respectively)
+- The SHODH OpenAPI spec is from [varun29ankuS/shodh-memory](https://github.com/varun29ankuS/shodh-memory)
+- MCP is the [Anthropic Model Context Protocol](https://modelcontextprotocol.io)
+- Embeddings via [Anush008/fastembed-rs](https://github.com/Anush008/fastembed-rs) + [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+- Native LLM scoring via [huggingface/candle](https://github.com/huggingface/candle) and [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B)
 
 — [abyo software, LLC](https://github.com/abyo-software)

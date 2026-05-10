@@ -5,6 +5,119 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-10
+
+### Added (Phase A + B + C + D + E)
+
+**Phase A — `--features candle` で candle-rs native prediction-loss 本実装**:
+- v0.4 D-spike (`examples/candle_spike.rs`、dev-dep のみ) を main lib に
+  productionize。`src/prediction_loss/candle_local.rs` 新設、`CandleLocalPredictionLoss` を `PredictionLossBackend` trait 実装
+- 新 feature flag `candle` (CPU) / `candle-cuda` (GPU、cuDNN system install
+  必要)。default は無効、`cargo install claude-hippo` は依然 lean
+- CLI: `--prediction-loss-backend candle-local` + `--candle-model-id` /
+  `--candle-cache-dir` / `--candle-cpu` フラグ追加
+- `PredictionLossBackendKind::CandleLocal` を always-declared 化、feature
+  無効ビルドで選択時は actionable error で fail-fast
+- `examples/candle_spike` を `required-features = ["candle"]` に移行、
+  dev-dep だった candle-* を optional production dep に昇格
+- 4 unit + 1 ignored smoke (`cargo test --features candle -- --ignored`、
+  ~1GB Qwen2.5-0.5B DL)
+
+**Phase B — Hebbian associations (SHODH consolidate の deferred 1/2)**:
+- 新 `memory_associations(from_id, to_id, weight, last_reinforced)` テーブル。
+  canonicalize (from_id < to_id) で 1 unordered edge = 1 row
+- `Storage::reinforce_co_recalled` / `neighbors_by_id` / `prune_associations` /
+  `count_associations` API
+- `RecallParams.{mode, seed_id}` で `"semantic"` (既定) / `"associative"` /
+  `"hebbian"` / `"hybrid"` / `"mixed"` を dispatch、`recall_with_options` を
+  3 mode 対応に refactor
+- 自動学習: recall 結果が ≥2 alive のとき final set の全 unordered pair を
+  reinforce (best-effort、失敗時 warn のみ)
+- `RankingConfig.{reinforce_co_recall (true), co_recall_alpha (0.1)}`、
+  CLI `--no-hebbian-reinforce` / `--co-recall-alpha`
+- consolidate に edge prune 追加: `edge_prune_threshold` (既定 0.01)、
+  `pruned_edges` / `associations_total` を response に、`deferred[]` から
+  `"association_discovery"` を削除
+- 9 storage unit + 5 server tokio test (parser aliases / reinforcement /
+  associative / hybrid dedup)
+
+**Phase C — Semantic clustering (SHODH consolidate の deferred 2/2)**:
+- 新 `memory_clusters(id, centroid_blob, size, last_recomputed)` テーブル。
+  centroid は `memory_embeddings.content_embedding` と同じ f32×384 LE blob
+- 各 memory の所属は `metadata._hippo.cluster_id` に json_set で persist、
+  別 join table 不要
+- `Storage::list_alive_embeddings` / `recompute_clusters(target_k, max_iters)` /
+  `list_clusters` / `count_clusters`
+- 内部: deterministic stride-init spherical k-means (Lloyd's iter on
+  L2-normalized vectors、convergence detection、empty cluster は前回 centroid
+  を keep)
+- 公開 type: `ClusterStats { k, iters, assigned, mean_intra_distance }` /
+  `ClusterInfo { id, size, last_recomputed }`
+- `< 4` alive embedding は no-op (k=0)、auto-k は `clamp(sqrt(alive/2), 2, 16)`
+- consolidate に opt-in `cluster: true` flag、`cluster_target_k`、
+  `cluster_stats` を response に、`deferred[]` を空配列化
+- 新 endpoint: `GET /api/clusters` → `{clusters, count}`
+- 4 storage unit + 2 axum tokio test (route registry を 13 → 14)
+
+**Phase D — Real-backend bench variants (`#[ignore]` opt-in)**:
+- `EvalConfig.embedder_override: Option<Arc<dyn Embedder>>` 追加。`Some(real_e)`
+  で `ClusteredMockEmbedder` を bypass、real fastembed / external HTTP に swap
+- `tests/eval_real_local.rs` — Bench A/B/C を FastEmbedder MiniLM (real ONNX)
+  で再走。`#[ignore]` (~80MB DL)、output `target/eval_results/bench_*_real_local.json`
+- `tests/eval_d_real_candle.rs` — Bench D を CandleLocalPredictionLoss CPU
+  (Qwen2.5-0.5B) で再走。`#[cfg(feature = "candle")]` + `#[ignore]` (~1GB DL +
+  ~10min CPU inference)
+- soft-assert: `p1_lift ≥ -1e-3` のみ (mock fixture の P@1=1.0 と区別、real
+  semantic noise 下で「rerank が劣化させない」最小 invariant)
+- `docs/SURPRISE_SELECTION.md` に Phase D セクション追加、4 variant の使い分け
+  を表形式で disclose
+
+**Phase E — Release prep**:
+- `Cargo.toml` version 0.4.0 → 0.5.0
+- `cargo check --features candle-cuda` clean (16 crates compiled) で build
+  path を verify。実 GPU リンクは cuDNN install 必要 (Phase A で disclose 済の
+  通り、本セッションでは未検証)
+- README v0.5 highlights 4 行 + Downloads badge
+
+### Stats
+
+- 98 → **129 tests** (+8 ignored real-backend gates)
+  - default cargo test: 109 → 129 pass + 3 ignored (real-local A/B/C)
+  - cargo test --features candle: 112 → 132 pass + 5 ignored (上記 + smoke +
+    real-candle D)
+- clippy --features candle / --no-default-features 両方 -D warnings clean
+- cargo fmt --check clean
+- 新規依存 (optional under `candle` feature): candle-core 0.9 / candle-nn 0.9 /
+  candle-transformers 0.9 / tokenizers 0.22 / hf-hub 0.5 (v0.4 では dev-dep
+  だった、本リリースで production optional 昇格)
+- crates.io: `cargo install claude-hippo` (lean default) /
+  `cargo install claude-hippo --features candle` (CPU candle) /
+  `cargo install claude-hippo --features candle-cuda` (GPU candle、cuDNN 要)
+
+### Honest disclosures (v0.6 で対処)
+
+1. candle-cuda real GPU smoke は cuDNN system install 必須、本セッションでは
+   compile smoke (`cargo check`) のみ。実 GPU 環境でのレイテンシ実測は別途
+2. candle-local は v0.5 で Qwen2 family 限定。Phi-3 / Llama-3 は forward + KV
+   cache reset glue が必要 (v0.6)
+3. candle Qwen2 forward は last-position-only logits を返すため per-position
+   forward = O(N) — 短文用途なら許容、長文向けには all-position-logits patch
+   が要る (v0.6)
+4. Bench A/B/C/D real-backend variant は実走させると数値が出るが、CI default
+   では走らせない (cold-start ~80MB or ~1GB DL)。release-time smoke は manual
+5. abyo-llm-probe Stage 2 (Vast.ai 4090) 完走 → 大モデル verdict は v0.5 範囲外
+6. associative recall は 1-hop のみ。2-hop以上の subgraph traversal は v0.6
+7. cluster_id を使った "redundant memory" auto-archival は未実装 (cluster_id
+   は metadata に attach するが consolidate の archival 判定には未連動)
+
+### Planned (v0.6)
+
+- candle Phi-3 / Llama-3 family サポート + all-position-logits patch
+- 2-hop associative recall (subgraph traversal)
+- cluster-aware archival (同 cluster + low surprise + above grace で auto-archive)
+- abyo-llm-probe Stage 2 verdict 反映 (大モデル NLL gradient の生データ)
+- candle-cuda 実 GPU latency 実測 + bench artefact
+
 ## [0.4.0] - 2026-05-10
 
 ### Added (Phase A + B + C + D-spike + E)

@@ -12,11 +12,11 @@ cargo install claude-hippo
 hippo serve  # MCP stdio server, ready for Claude Code
 ```
 
-**v0.4 highlights** (released 2026-05-10):
-- 4 つの transport: MCP stdio (Claude Code) / SHODH OpenAPI v1.0.0 REST (13 endpoints) / Anthropic Memory Tool 互換 / external embedding HTTP (OpenAI/Ollama/vLLM/HF TEI)
-- Pure Rust 軽量: external embedding mode で **RSS 25.7 MB 実測** (local fastembed 150 MB の 17%)
-- Bench A/B/C/D で surprise rerank の数値証拠 (precision@1 0.08 → 1.000、365 日越え decision の demotion 完全解消)
-- v0.4 D-spike: candle-rs で local prediction-loss 動作確認、predictable cliché vs specific decision で実 NLL gradient を観測 (v0.5 で `--features candle` 化予定)
+**v0.5 highlights** (released 2026-05-10):
+- `--features candle` で **candle-rs native prediction-loss** が main lib に統合 (v0.4 D-spike を本番化、CPU `candle` / GPU `candle-cuda` 両 flag、Qwen2.5-0.5B 既定)
+- **Hebbian associations**: `memory_associations` 別テーブル + 自動 co-recall reinforcement + `recall mode=associative/hybrid` + consolidate edge prune (SHODH `associative recall` 仕様準拠)
+- **Semantic clustering**: spherical k-means + `memory_clusters` テーブル + `GET /api/clusters` + consolidate `cluster: true` flag (SHODH consolidate の deferred 全項目 wire 完了)
+- Real-backend bench variants (`tests/eval_*_real_*.rs`): FastEmbedder ONNX + CandleLocalPredictionLoss CPU で v0.2-v0.4 fixture を再走 (`#[ignore]` opt-in、release smoke 用)
 
 ---
 

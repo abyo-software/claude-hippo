@@ -4,12 +4,19 @@
 > 全部覚える代わりに、**特異性が高い瞬間だけ** を長期記憶化する surprise-aware memory store。
 
 [![crates.io](https://img.shields.io/crates/v/claude-hippo.svg)](https://crates.io/crates/claude-hippo)
+[![Downloads](https://img.shields.io/crates/d/claude-hippo.svg)](https://crates.io/crates/claude-hippo)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue)](#license)
 
 ```bash
 cargo install claude-hippo
 hippo serve  # MCP stdio server, ready for Claude Code
 ```
+
+**v0.4 highlights** (released 2026-05-10):
+- 4 つの transport: MCP stdio (Claude Code) / SHODH OpenAPI v1.0.0 REST (13 endpoints) / Anthropic Memory Tool 互換 / external embedding HTTP (OpenAI/Ollama/vLLM/HF TEI)
+- Pure Rust 軽量: external embedding mode で **RSS 25.7 MB 実測** (local fastembed 150 MB の 17%)
+- Bench A/B/C/D で surprise rerank の数値証拠 (precision@1 0.08 → 1.000、365 日越え decision の demotion 完全解消)
+- v0.4 D-spike: candle-rs で local prediction-loss 動作確認、predictable cliché vs specific decision で実 NLL gradient を観測 (v0.5 で `--features candle` 化予定)
 
 ---
 

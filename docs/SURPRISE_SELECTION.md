@@ -138,6 +138,45 @@ LongMemEval 等の汎用 vector 検索ベンチでは負ける可能性が高い
 > external` 経由）が、surprise rerank の寄与は score 算術に依存しており、
 > embedding 分布には依存しないため、定性的な結論は変わらない。
 
+### v0.4 実測: 実 Ollama (`all-minilm`, 384 dim) を `--embedding-backend external` で叩いた smoke
+
+`hippo bench --n 100 --embedding-backend external --external-embedding-url http://localhost:11434/v1/embeddings --external-embedding-model all-minilm --external-embedding-api-key-env NONE`:
+
+| metric | local fastembed (v0.1 baseline) | external Ollama (v0.4 smoke) | wiremock in-process (v0.3 bench) |
+|---|---|---|---|
+| cold-start | 4.5 ms | **802 ms** (Ollama warm + first round-trip) | n/a (in-process) |
+| store p50 | 3.1 ms | **11.4 ms** | 0.6 ms |
+| retrieve p50 | 2.7 ms | **14.9 ms** | 0.7 ms |
+| peak RSS (claude-hippo only) | 150 MB | **26.4 MB** | 25.7 MB |
+
+**読み方**: 実 Ollama 経路は HTTP round-trip が ~10ms × 2 (store と retrieve) で latency が支配される。引き換えに **in-process RSS は 26 MB** (local fastembed 150 MB の 17%)。Ollama 自体は別 process で別途数 GB のメモリを消費するので、システム全体の trade-off は「in-process 小さく、外に出す」。
+
+**Bench A/B/C を実 Ollama embedding で再走しなかった理由**: eval harness は `ClusteredMockEmbedder` を使い、cluster 中心が決定的に直交する空間で surprise rerank の score arithmetic を観測する設計。real Ollama embedding に swap すると embedding 分布が変わって precision@1 / MRR の baseline 比較が成り立たなくなる（surprise rerank の寄与は変わらないが「絶対値」が違う数字になる）。real semantic gradient での bench を別途まとめる場合は、SQuAD 系 IR ベンチをそのまま走らせる方が正しい。本リポジトリは「surprise rerank の寄与」を測るのが目的なので mock embedder を継続採用する。
+
+### 実 LLM での prediction-loss bench は v0.4 D-spike で local 検証成功
+
+Phase C で Ollama を試したが、Ollama の `/v1/completions` は `echo + max_tokens=0 + logprobs` を honour せず（OpenAI-compat layer の既知制約、生成側のみ logprobs を返す）。`--prediction-loss-backend openai-compat` を実機で叩くには **vLLM** または **llama.cpp の native /completion endpoint**（OpenAI-compat ではない）が必要。Bench D は引き続き MockPredictionLoss で wiring smoke のみ。
+
+#### Phase D-spike: candle-rs (pure Rust) で local prediction-loss が動作した実数値
+
+`cargo run --release --example candle_spike` (Qwen2.5-0.5B BF16, CPU 推論):
+
+| sample (8-30 token) | mean NLL (nats/tok) | surprise (= NLL/6) | latency |
+|---|---:|---:|---:|
+| `the quick brown fox jumps over the lazy dog` | 1.20 | **0.20** | 993 ms |
+| `todo: fix the bug` | 4.34 | 0.72 | 422 ms |
+| `After auditing 47k OpenTelemetry spans we picked OTLP over Jaeger because of native TLS 1.3 support` | **4.96** | **0.83** | 3919 ms |
+| `the proton-to-electron mass ratio decreased by 12% under quantum gravity at noon` | 4.12 | 0.69 | 2386 ms |
+
+**読み方**: predictable cliché (fox/dog) は NLL=1.2 で低 surprise、specific decision (OpenTelemetry/OTLP) は NLL=5.0 で高 surprise — 期待通りの勾配。
+
+**verdict**: candle-rs native backend は技術的に実現可能、v0.5 で `--features candle` flag 経由で production 化する価値あり。
+
+**v0.4 spike の制約**:
+- CPU 推論 (cuDNN system install 不要のため)。GPU 推論には `libcudnn8` が必要 (~500 MB)、v0.5 で `--features candle-cuda` として opt-in
+- per-position forward (Qwen2 は最終 token logits のみ返す) のため O(N) forward = N=30 で ~3-4 秒 / sentence。CUDA + cudnn なら 50-100 ms / sentence 想定
+- spike は examples/ で dev-dep のみ、main lib は未触 (release crate を lean に保つ)
+
 ### Bench A: Long-session noise
 
 100 ターン会話 (5 トピックに各 1 Decision + 19 chat = 100 items)。各トピック

@@ -1,6 +1,6 @@
 [package]
 name = "claude-hippo"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["abyo software, LLC <youichi.uda@gmail.com>"]
@@ -84,6 +84,16 @@ tempfile = "3"
 proptest = "1"
 serial_test = "3"
 wiremock = "0.6"
+
+# v0.4 D-spike: pure-Rust LLM inference for native prediction-loss backend.
+# Dev-dep only — keeps `cargo install claude-hippo` lean and lets the spike
+# prove the path without committing to a heavy required dependency. If the
+# spike succeeds, productionize behind a `--features candle` flag in v0.5.
+candle-core = { version = "0.9", default-features = false }
+candle-nn = { version = "0.9", default-features = false }
+candle-transformers = { version = "0.9", default-features = false }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
 
 [profile.release]
 opt-level = 3

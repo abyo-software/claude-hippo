@@ -5,6 +5,83 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-10
+
+### Added (Phase A + B + C + D-spike + E)
+
+**Phase A — In-process dual-serve (stdio MCP + SHODH REST 同居)**:
+- `MemoryServer::from_shared_storage(...)` 新コンストラクタ — `Arc<Mutex<Storage>>` + `Arc<dyn Embedder>` + `Option<Arc<dyn PredictionLossBackend>>` を 2 instance で共有
+- CLI `run_serve_with_optional_rest` を refactor: `--shodh-rest` 設定時に rest_instance + mcp_instance を build、`tokio::spawn` 2 本を `tokio::select!` で監視。どちらかの exit/error で process 終了
+- v0.3 caveat 「1 process = 1 transport」を解消
+- 2 integration tests (`tests/dual_serve.rs`): REST 経由で書いた memory が直接 instance から見える / 双方向 write 可視性
+
+**Phase B-1 — SHODH `/api/consolidate` endpoint**:
+- exponential decay scoring + quality-based archival of low-value memories
+- 入力: `archive_threshold` (default 0.05) / `grace_period_days` (default 30) / `limit` / `dry_run`
+- decay は `server.ranking_config().{half_life_days, decay_floor}` を流用
+- 出力: archived list + total_alive before/after + dry_run flag + `deferred=["association_discovery", "semantic_clustering"]` (SHODH spec の残り 2 機能の honest disclosure)
+- association discovery (Hebbian edges) + semantic clustering は schema 変更要のため v0.5 候補
+- 3 axum unit tests
+
+**Phase B-2 — SHODH 残り 6 endpoint**:
+- `POST /api/recall/by-tags` — tag AND-OR search
+- `POST /api/forget/by-tags` — bulk soft-delete with dry_run
+- `GET /api/memories/{id}` — fetch by id, 404 if missing
+- `PATCH /api/memories/{id}` — metadata 編集、`_hippo` namespace 自動保存 (surprise score 維持)、content/hash 不変
+- `GET /api/tags` — alive tags の (tag, count) 集計
+- `POST /api/context` — query → optional auto_ingest → recall 関連メモリ
+- `Storage::update_metadata_by_id(...)` + `Storage::list_tags()` 新 API
+- 8 axum unit tests + `all_13_endpoints_route_to_a_handler` regression net
+- **SHODH OpenAPI v1.0.0 全 13 endpoint 実装完了**
+
+**Phase C — 実 Ollama smoke (embedding only)**:
+- Ollama 1.x install + `all-minilm` (384 dim) pull
+- `hippo bench --embedding-backend external --external-embedding-url http://localhost:11434/v1/embeddings --external-embedding-model all-minilm --external-embedding-api-key-env NONE`:
+  - cold-start: 802 ms (Ollama warm + first round-trip)
+  - store p50: 11.4 ms / retrieve p50: 14.9 ms (network round-trip 主)
+  - **peak RSS: 26.4 MB** (local fastembed 150 MB の 17%)
+- prediction-loss: Ollama の `/v1/completions` は `echo + max_tokens=0 + logprobs` を honour せず、honest disclosure (vLLM / llama.cpp / candle-rs native v0.5 が必要) を `docs/SURPRISE_SELECTION.md` に追記
+- Bench A/B/C は ClusteredMockEmbedder で決定的を維持 (real backend に swap すると baseline 比較壊れる、honest disclosure 込み)
+
+**Phase D-spike — candle-rs native prediction-loss (PoC 成功)**:
+- `examples/candle_spike.rs` — Qwen2.5-0.5B BF16, CPU 推論 (CUDA は cuDNN system install 必要のため v0.5)
+- 4 sample で実 NLL 取得:
+  - `the quick brown fox jumps over the lazy dog`: NLL=1.20 → surprise=0.20
+  - `todo: fix the bug`: NLL=4.34 → surprise=0.72
+  - `After auditing 47k OpenTelemetry spans we picked OTLP over Jaeger because of native TLS 1.3 support`: NLL=4.96 → **surprise=0.83**
+  - `the proton-to-electron mass ratio decreased by 12% under quantum gravity at noon`: NLL=4.12 → surprise=0.69
+- 期待通りの勾配 (predictable cliché 低 / specific decision 高) → v0.5 で `--features candle` flag 経由で production 化判断
+- candle-rs (candle-core / candle-nn / candle-transformers / tokenizers) は dev-dep のみ追加、main crate を lean 維持
+
+**Phase E — Traction**:
+- `docs/SHOW_HN_DRAFT.md` 新設 — HN / Lobsters / r/rust / r/ClaudeAI 向け投稿 draft (英 + alt 短縮版)
+- `README.md` に v0.4 highlights 4 行追加 + Downloads badge
+- v0.3 release momentum 活用ねらい
+
+### Stats
+
+- 87 → **98 tests** (82 unit + 9 wiremock embedding + 9 wiremock prediction_loss + 3 integration + 4 eval + 2 dual-serve + 11 axum REST)
+- clippy clean、fmt clean、cargo audit 0 new advisories
+- 新規依存 (dev only): candle-core 0.9 / candle-nn 0.9 / candle-transformers 0.9 / tokenizers 0.22 / hf-hub 0.5 (dev-dep)
+- crates.io: `cargo install claude-hippo`
+- GitHub: https://github.com/abyo-software/claude-hippo/releases/tag/v0.4.0
+
+### Honest disclosures (v0.5 で対処)
+
+1. SHODH `consolidate` の association discovery (Hebbian edges) + semantic clustering は schema 要変更で deferred
+2. prediction-loss real LLM bench は local D-spike のみ、Bench A/B/C 全自動再走は未走 (real backend が決定的でないため設計が要再考)
+3. candle-rs CUDA path は cuDNN system install 必要、v0.5 で `--features candle-cuda` として opt-in
+4. candle-rs spike は examples/ 経由のみ、main lib への production 統合は v0.5
+5. GUI client (Cursor / Continue) 自動検証は引き続き手動 smoke per release
+
+### Planned (v0.5)
+
+- `--features candle` で candle-rs native prediction-loss を main lib に統合 (`CandleLocalPredictionLoss`)
+- `--features candle-cuda` で GPU acceleration (cuDNN install required)
+- SHODH consolidate に association discovery + semantic clustering を追加 (Hebbian `memory_associations` 別テーブル新設)
+- abyo-llm-probe Stage 2 (Vast.ai 4090) 完走 → 大モデル (Phi-3.5-mini / Llama 3.1 8B) の verdict 取得
+- Bench A-D に real backend variant を追加 (再現性 vs 実機の trade-off を整理)
+
 ## [0.3.0] - 2026-05-10
 
 ### Added (Phase A + B + C + D)

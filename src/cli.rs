@@ -115,6 +115,23 @@ struct PredictionLossFlags {
     /// higher = less sensitive.
     #[arg(long, env = "HIPPO_PREDICTION_LOSS_SCALE")]
     prediction_loss_scale: Option<f32>,
+
+    // ---- v0.5: --prediction-loss-backend candle-local options ----
+    /// Hugging Face model id for `candle-local` backend. Default
+    /// `Qwen/Qwen2.5-0.5B`. Must be a Qwen2-family model in v0.5;
+    /// other architectures land in v0.6.
+    #[arg(long, env = "HIPPO_CANDLE_MODEL_ID")]
+    candle_model_id: Option<String>,
+
+    /// Override HF cache dir for the `candle-local` backend. Default
+    /// uses `~/.cache/huggingface/`.
+    #[arg(long, env = "HIPPO_CANDLE_CACHE_DIR")]
+    candle_cache_dir: Option<PathBuf>,
+
+    /// Force CPU even on a `--features candle-cuda` build. Useful for
+    /// reproducibility and for sidestepping cuDNN install issues.
+    #[arg(long, env = "HIPPO_CANDLE_CPU")]
+    candle_cpu: bool,
 }
 
 impl PredictionLossFlags {
@@ -349,7 +366,42 @@ fn build_prediction_loss_backend(
                 .map_err(|e: HippoError| anyhow::anyhow!(e))?;
             Ok(Some(Arc::new(backend)))
         }
+        PredictionLossBackendKind::CandleLocal => build_candle_backend(flags),
     }
+}
+
+#[cfg(feature = "candle")]
+fn build_candle_backend(
+    flags: &PredictionLossFlags,
+) -> anyhow::Result<Option<Arc<dyn PredictionLossBackend>>> {
+    use crate::prediction_loss::{
+        CandleLocalConfig, CandleLocalPredictionLoss, CANDLE_DEFAULT_LOSS_SCALE,
+        DEFAULT_CANDLE_MODEL_ID,
+    };
+    let cfg = CandleLocalConfig {
+        model_id: flags
+            .candle_model_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CANDLE_MODEL_ID.to_string()),
+        cache_dir: flags.candle_cache_dir.clone(),
+        loss_scale: flags
+            .prediction_loss_scale
+            .unwrap_or(CANDLE_DEFAULT_LOSS_SCALE),
+        use_gpu: !flags.candle_cpu,
+    };
+    let backend = CandleLocalPredictionLoss::new(cfg).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Some(Arc::new(backend)))
+}
+
+#[cfg(not(feature = "candle"))]
+fn build_candle_backend(
+    _flags: &PredictionLossFlags,
+) -> anyhow::Result<Option<Arc<dyn PredictionLossBackend>>> {
+    anyhow::bail!(
+        "--prediction-loss-backend candle-local requires this binary to be built with \
+         `--features candle` (or `--features candle-cuda` for GPU). Reinstall with \
+         `cargo install claude-hippo --features candle`."
+    )
 }
 
 fn prediction_loss_label(flags: &PredictionLossFlags) -> String {
@@ -365,6 +417,14 @@ fn prediction_loss_label(flags: &PredictionLossFlags) -> String {
                 .prediction_loss_url
                 .as_deref()
                 .unwrap_or("(missing-url)"),
+        ),
+        PredictionLossBackendKind::CandleLocal => format!(
+            "candle-local:{}{}",
+            flags
+                .candle_model_id
+                .as_deref()
+                .unwrap_or("Qwen/Qwen2.5-0.5B"),
+            if flags.candle_cpu { " (cpu)" } else { "" },
         ),
     }
 }
@@ -461,6 +521,9 @@ pub async fn run() -> anyhow::Result<()> {
             prediction_loss_timeout_ms: None,
             prediction_loss_max_retries: None,
             prediction_loss_scale: None,
+            candle_model_id: None,
+            candle_cache_dir: None,
+            candle_cpu: false,
         },
         half_life_days: None,
         decay_floor: None,

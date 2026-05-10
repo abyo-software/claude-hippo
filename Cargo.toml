@@ -17,6 +17,10 @@ categories = ["command-line-utilities", "database", "science"]
 name = "hippo"
 path = "src/main.rs"
 
+[[example]]
+name = "candle_spike"
+required-features = ["candle"]
+
 [lib]
 name = "claude_hippo"
 path = "src/lib.rs"
@@ -79,21 +83,31 @@ parking_lot = "0.12"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "matched-path", "query"] }
 tower = { version = "0.5", default-features = false }
 
+# v0.5 Phase A: candle-rs native prediction-loss backend.
+# Optional — `cargo install claude-hippo` stays lean (no candle compile, no
+# 50MB binary bloat). Power users opt in with `--features candle` for the
+# CPU build, or `--features candle-cuda` if they have cuDNN installed.
+candle-core = { version = "0.9", default-features = false, optional = true }
+candle-nn = { version = "0.9", default-features = false, optional = true }
+candle-transformers = { version = "0.9", default-features = false, optional = true }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
+hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"], optional = true }
+
+[features]
+default = []
+# CPU candle-rs backend. Wires `--prediction-loss-backend candle-local`
+# into the CLI/MemoryServer. Adds ~5min compile time and ~50MB to the
+# binary.
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+# GPU candle-rs backend. Same APIs as `candle`, but routes inference to
+# CUDA. Requires libcudnn{8,9} installed at link time.
+candle-cuda = ["candle", "candle-core/cuda", "candle-core/cudnn", "candle-nn/cuda", "candle-transformers/cuda"]
+
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
 serial_test = "3"
 wiremock = "0.6"
-
-# v0.4 D-spike: pure-Rust LLM inference for native prediction-loss backend.
-# Dev-dep only — keeps `cargo install claude-hippo` lean and lets the spike
-# prove the path without committing to a heavy required dependency. If the
-# spike succeeds, productionize behind a `--features candle` flag in v0.5.
-candle-core = { version = "0.9", default-features = false }
-candle-nn = { version = "0.9", default-features = false }
-candle-transformers = { version = "0.9", default-features = false }
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
 
 [profile.release]
 opt-level = 3

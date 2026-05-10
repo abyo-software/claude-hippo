@@ -49,9 +49,16 @@
 use crate::Result;
 
 pub mod external;
+#[cfg(feature = "candle")]
+pub mod candle_local;
 
 pub use external::{
     ExternalPredictionLossBackend, ExternalPredictionLossConfig, DEFAULT_LOSS_SCALE,
+};
+#[cfg(feature = "candle")]
+pub use candle_local::{
+    CandleLocalConfig, CandleLocalPredictionLoss, DEFAULT_CANDLE_MODEL_ID,
+    DEFAULT_LOSS_SCALE as CANDLE_DEFAULT_LOSS_SCALE,
 };
 
 /// Scores the surprise of arbitrary content via an LLM. Sync trait — like
@@ -65,9 +72,13 @@ pub trait PredictionLossBackend: Send + Sync {
     fn predict_loss(&self, content: &str) -> Result<f32>;
 }
 
-/// CLI selector for prediction-loss backend. Only one variant is wired
-/// today; the enum exists so future backends (candle-rs native, etc.)
-/// can be added without breaking the CLI surface.
+/// CLI selector for prediction-loss backend.
+///
+/// `CandleLocal` is only available when compiled with `--features candle`
+/// (CPU) or `--features candle-cuda` (GPU). The enum variant is always
+/// declared so the parser surface is stable; selecting it without the
+/// feature returns an actionable error at construction time rather than
+/// silently falling back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PredictionLossBackendKind {
     /// No backend wired. `prediction_loss` stays `None`; surprise score
@@ -79,6 +90,10 @@ pub enum PredictionLossBackendKind {
     /// `echo + max_tokens=0 + logprobs`. Works with vLLM, llama.cpp,
     /// Ollama (via shim), legacy OpenAI completions.
     OpenAiCompat,
+    /// Pure-Rust local backend via candle-rs (v0.5, gated `--features
+    /// candle`). Loads a HuggingFace model in-process and computes mean
+    /// NLL per token without a network round-trip.
+    CandleLocal,
 }
 
 impl PredictionLossBackendKind {
@@ -88,8 +103,10 @@ impl PredictionLossBackendKind {
             "openai-compat" | "openai" | "vllm" | "llamacpp" | "llama-cpp" => {
                 Ok(Self::OpenAiCompat)
             }
+            "candle-local" | "candle" | "local" => Ok(Self::CandleLocal),
             other => Err(format!(
-                "unknown prediction-loss backend: {other:?} (expected: none, openai-compat)"
+                "unknown prediction-loss backend: {other:?} \
+                 (expected: none, openai-compat, candle-local)"
             )),
         }
     }
@@ -98,6 +115,7 @@ impl PredictionLossBackendKind {
         match self {
             Self::None => "none",
             Self::OpenAiCompat => "openai-compat",
+            Self::CandleLocal => "candle-local",
         }
     }
 }
@@ -142,6 +160,18 @@ mod tests {
         assert_eq!(
             PredictionLossBackendKind::parse("OFF").unwrap(),
             PredictionLossBackendKind::None
+        );
+        assert_eq!(
+            PredictionLossBackendKind::parse("candle-local").unwrap(),
+            PredictionLossBackendKind::CandleLocal
+        );
+        assert_eq!(
+            PredictionLossBackendKind::parse("candle").unwrap(),
+            PredictionLossBackendKind::CandleLocal
+        );
+        assert_eq!(
+            PredictionLossBackendKind::parse("LOCAL").unwrap(),
+            PredictionLossBackendKind::CandleLocal
         );
     }
 

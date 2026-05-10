@@ -118,6 +118,7 @@ fn build_config(age_days: f32, oversample_factor: usize) -> EvalConfig {
         noise_scale: 0.05,
         oversample_factor,
         prediction_loss: None,
+        embedder_override: None,
     }
 }
 

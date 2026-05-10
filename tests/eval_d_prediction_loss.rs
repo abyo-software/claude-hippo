@@ -110,6 +110,7 @@ fn build_config(backend: Option<Arc<dyn PredictionLossBackend>>) -> EvalConfig {
         noise_scale: 0.05,
         oversample_factor: claude_hippo::server::DEFAULT_OVERSAMPLE_FACTOR,
         prediction_loss: backend,
+        embedder_override: None,
     }
 }
 

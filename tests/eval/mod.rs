@@ -201,6 +201,19 @@ pub struct EvalConfig {
     /// Bench D exercises this; A/B/C leave it `None` for v0.2 parity.
     #[allow(clippy::type_complexity)]
     pub prediction_loss: Option<Arc<dyn PredictionLossBackend>>,
+    /// v0.5 Phase D: optional embedder override. When `Some`, the eval
+    /// run uses the supplied embedder verbatim (real fastembed, external
+    /// HTTP, etc.) and the `num_clusters / fallback_cluster / noise_scale`
+    /// fields become advisory — they're still accepted for API stability
+    /// but ignored. When `None` (default), the deterministic
+    /// `ClusteredMockEmbedder` is used as in v0.2-v0.4.
+    ///
+    /// The "real backend variant" benches use this to measure how the
+    /// surprise-rerank lift holds up against actual semantic similarity
+    /// (less idealized than orthogonal mock clusters), trading
+    /// reproducibility for production realism.
+    #[allow(clippy::type_complexity)]
+    pub embedder_override: Option<Arc<dyn Embedder>>,
 }
 
 pub async fn run_ablation(cfg: EvalConfig) -> anyhow::Result<AblationResult> {
@@ -215,16 +228,22 @@ pub async fn run_ablation(cfg: EvalConfig) -> anyhow::Result<AblationResult> {
 async fn run_one(cfg: &EvalConfig, no_surprise_boost: bool) -> anyhow::Result<Metrics> {
     claude_hippo::storage::register_sqlite_vec();
 
-    // Build embedder with all known texts pre-registered to clusters.
-    let mut embedder =
-        ClusteredMockEmbedder::new(cfg.num_clusters, cfg.fallback_cluster, cfg.noise_scale);
-    for it in &cfg.items {
-        embedder.assign(it.content.clone(), it.cluster);
-    }
-    for q in &cfg.queries {
-        embedder.assign(q.query.clone(), q.cluster);
-    }
-    let embedder: Arc<dyn Embedder> = Arc::new(embedder);
+    // Build embedder. Real-backend variants (v0.5 Phase D) supply their
+    // own through `embedder_override`; mock-fixture benches build the
+    // deterministic ClusteredMockEmbedder.
+    let embedder: Arc<dyn Embedder> = if let Some(e) = cfg.embedder_override.clone() {
+        e
+    } else {
+        let mut embedder =
+            ClusteredMockEmbedder::new(cfg.num_clusters, cfg.fallback_cluster, cfg.noise_scale);
+        for it in &cfg.items {
+            embedder.assign(it.content.clone(), it.cluster);
+        }
+        for q in &cfg.queries {
+            embedder.assign(q.query.clone(), q.cluster);
+        }
+        Arc::new(embedder)
+    };
 
     let store = Storage::open_in_memory()?;
     let server = MemoryServer::new_full(

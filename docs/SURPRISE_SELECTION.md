@@ -153,6 +153,21 @@ LongMemEval 等の汎用 vector 検索ベンチでは負ける可能性が高い
 
 **Bench A/B/C を実 Ollama embedding で再走しなかった理由**: eval harness は `ClusteredMockEmbedder` を使い、cluster 中心が決定的に直交する空間で surprise rerank の score arithmetic を観測する設計。real Ollama embedding に swap すると embedding 分布が変わって precision@1 / MRR の baseline 比較が成り立たなくなる（surprise rerank の寄与は変わらないが「絶対値」が違う数字になる）。real semantic gradient での bench を別途まとめる場合は、SQuAD 系 IR ベンチをそのまま走らせる方が正しい。本リポジトリは「surprise rerank の寄与」を測るのが目的なので mock embedder を継続採用する。
 
+#### v0.5 Phase D: real-backend variant を `#[ignore]` 付き opt-in で同居
+
+mock fixture の数字 (P@1=1.0) は「直交 cluster という idealized な世界での score arithmetic は正しい」ことを示すだけで、real fastembed や real LLM NLL では同じ数字が出るとは保証されない、というのは v0.4 まで誠実に開示してきた点。v0.5 Phase D で **real-backend variant を tests/ 内に同居** させ、再現性は `#[ignore]` で隔離しつつ、release smoke で検証可能にした。
+
+| variant | embedder | prediction_loss | 走らせ方 | output |
+|---|---|---|---|---|
+| Bench A real-local | FastEmbedder MiniLM (real ONNX) | None | `cargo test -- --ignored bench_a_real_local` | `target/eval_results/bench_a_real_local.json` |
+| Bench B real-local | 同上 | None | `… bench_b_real_local` | `bench_b_real_local.json` |
+| Bench C real-local | 同上 | None | `… bench_c_real_local` | `bench_c_real_local.json` |
+| Bench D real-candle | mock embedder | CandleLocalPredictionLoss CPU (Qwen2.5-0.5B) | `cargo test --features candle -- --ignored bench_d_real_candle` | `bench_d_real_candle.json` |
+
+**pass/fail criteria**: real-backend variant は等値 assertion を持たない。**`p1_lift = with_surprise.precision_at_1 - baseline.precision_at_1 ≥ 0`** を soft-assert する (≤ -1e-3 で fail)。real semantic similarity の noise の中で「surprise rerank が pure cosine を絶対に劣化させない」ことだけを保証し、+0.95 のような大きな lift は idealized fixture 限定の値として明示的に区別する。
+
+**re-run 推奨頻度**: GA release 直前 ×1 + ROADMAP 上の embedding/prediction-loss 変更 commit 直後。CI default は走らせない (cold-start で fastembed が ~80MB、candle が ~1GB DL する)。
+
 ### 実 LLM での prediction-loss bench は v0.4 D-spike で local 検証成功
 
 Phase C で Ollama を試したが、Ollama の `/v1/completions` は `echo + max_tokens=0 + logprobs` を honour せず（OpenAI-compat layer の既知制約、生成側のみ logprobs を返す）。`--prediction-loss-backend openai-compat` を実機で叩くには **vLLM** または **llama.cpp の native /completion endpoint**（OpenAI-compat ではない）が必要。Bench D は引き続き MockPredictionLoss で wiring smoke のみ。

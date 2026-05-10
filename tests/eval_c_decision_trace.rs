@@ -147,6 +147,7 @@ fn build_config(weights: SurpriseWeights, oversample_factor: usize) -> EvalConfi
         noise_scale: 0.05,
         oversample_factor,
         prediction_loss: None,
+        embedder_override: None,
     }
 }
 

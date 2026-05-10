@@ -414,6 +414,72 @@ impl Storage {
         )?;
         Ok(n)
     }
+
+    /// v0.4: update metadata + tags + memory_type for an existing memory.
+    /// Content (and content_hash) stays — SHODH `PATCH /api/memories/{id}` is
+    /// explicitly metadata-only. `metadata` overwrites the full JSON field;
+    /// pass the result of merging with `get_by_id(...).metadata` if you want
+    /// merge semantics (we keep the API simple and let the caller decide).
+    pub fn update_metadata_by_id(
+        &mut self,
+        id: i64,
+        metadata: &serde_json::Value,
+        tags: Option<&[String]>,
+        memory_type: Option<Option<&str>>,
+    ) -> Result<usize> {
+        let now = unix_now();
+        let now_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let metadata_str = serde_json::to_string(metadata)?;
+        let n = match (tags, memory_type) {
+            (Some(t), Some(mt)) => self.conn.execute(
+                "UPDATE memories SET metadata = ?1, tags = ?2, memory_type = ?3,
+                 updated_at = ?4, updated_at_iso = ?5
+                 WHERE id = ?6 AND deleted_at IS NULL",
+                params![metadata_str, encode_tags(t), mt, now, now_iso, id],
+            )?,
+            (Some(t), None) => self.conn.execute(
+                "UPDATE memories SET metadata = ?1, tags = ?2,
+                 updated_at = ?3, updated_at_iso = ?4
+                 WHERE id = ?5 AND deleted_at IS NULL",
+                params![metadata_str, encode_tags(t), now, now_iso, id],
+            )?,
+            (None, Some(mt)) => self.conn.execute(
+                "UPDATE memories SET metadata = ?1, memory_type = ?2,
+                 updated_at = ?3, updated_at_iso = ?4
+                 WHERE id = ?5 AND deleted_at IS NULL",
+                params![metadata_str, mt, now, now_iso, id],
+            )?,
+            (None, None) => self.conn.execute(
+                "UPDATE memories SET metadata = ?1, updated_at = ?2, updated_at_iso = ?3
+                 WHERE id = ?4 AND deleted_at IS NULL",
+                params![metadata_str, now, now_iso, id],
+            )?,
+        };
+        Ok(n)
+    }
+
+    /// v0.4: aggregate alive tags with counts. Used by SHODH `GET /api/tags`.
+    /// Returns `[(tag, count)]` sorted by count desc then tag asc.
+    pub fn list_tags(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tags FROM memories WHERE deleted_at IS NULL AND tags IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for row in rows {
+            if let Some(s) = row? {
+                for t in s.split(',') {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        *counts.entry(t.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut v: Vec<(String, i64)> = counts.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok(v)
+    }
 }
 
 fn row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
